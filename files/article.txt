@@ -1,0 +1,350 @@
+Stock market today: S&P 500, Nasdaq slip as AI angst overshadows hopes for end to US shutdown
+
+SoftBank sells its Nvidia stake for $5.8 billionScroll back up to restore default view.
+Rian Howlett, Karen Friar and Laura Bratton
+Updated Tue, November 11, 2025 at 4:26 PM GMT+1 2 min read
+
+In this article:
+
+
+StockStory Top Pick
+NVDA
+-3.32%
+
+9984.T
++1.98%
+
+^GSPC
+-0.30%
+
+^DJI
++0.32%
+
+^SPX
+-0.27%
+
+Tech led a retreat in US stocks on Tuesday amid a revival in AI worries, slipping back from a rally fueled by optimism that Washington may soon end the record-breaking government shutdown.
+
+The S&P 500 (^GSPC) fell below the flat line, and the Nasdaq Composite (^IXIC) slipped roughly 0.5%. The Dow Jones Industrial Average (^DJI), which includes fewer tech stocks, inched up 0.2%. The pullback follows a roaring start to the week for stocks as hopes for the AI trade revived.
+
+DJI - Free Realtime Quote
+•
+USD
+(^DJI)
+
+Follow
+View Quote Details
+47,521.35
++152.72
+(+0.32%)
+As of 10:30:13 AM EST. Market Open.
+^DJI
+^IXIC
+^GSPC
+Date	
+Close	
+Open	
+High	
+Low	
+1D5D1M6MYTD1Y5YAll
+Testing that faith, SoftBank Group (SFTBY) said Tuesday it sold its entire stake in chipmaker Nvidia (NVDA) to fund its own investments in AI development. The move comes at a time that Wall Street is questioning whether the AI spending spree will pay off amid lofty valuations for related stocks. Shares of Nvidia dropped about 2% in early trading.
+
+Elsewhere in tech, CoreWeave (CRWV) trimmed its full-year revenue forecast after market close, taking the shine off its strong quarterly earnings. Its stock fell around 11% after the Nvidia (NVDA)-backed AI infrastructure provider flagged a delay by a data center partner.
+
+Those concerns weighed on markets, despite growing hopes that the 41-day US shutdown could soon end. The push to reopen government took another step forward as the Senate on Monday evening passed a funding measure, advancing it to the House for a vote.
+
+A reopening would lead to the release of economic data delayed by the stoppage, giving markets better insight into the likely path of interest rates. But fresh data could take a while to arrive, even if the shutdown ends this week.
+
+US companies shed 11,250 jobs a week during October, ADP's private-sector payrolls report out Tuesday showed — an example of the private data filling the public vacuum. Its figures suggest a slowing in the labor market.
+
+On the trade front, doubts about the lasting power of the US-China tariff truce resurfaced around the crucial issue of rare-earth supplies. The Wall Street Journal reported that Beijing plans to keep its exports of the minerals out of US military hands, even as it speeds up flows to other American buyers.
+
+LIVE 10 updates
+Laura Bratton
+4 mins ago
+Laura Bratton
+CoreWeave sinks as AI cloud firm trims revenue forecast
+CoreWeave's (CRWV) stock sank more than 9% after the Nvidia-backed (NVDA) company trimmed its full-year revenue forecast.
+
+The AI data center and cloud provider lowered its 2025 revenue guidance to a range of $5.05 billion to $5.15 billion. Its prior range was $5.15 billion to $5.35 billion.
+
+CoreWeave also slashed its capital expenditure forecast, as one of its third-party data center developers fell behind schedule, affecting its ability to bring computing capacity online.
+
+NasdaqGS - Nasdaq Real Time Price
+•
+USD
+(CRWV)
+
+Follow
+View Quote Details
+90.44
+-15.17
+(-14.36%)
+As of 10:30:29 AM EST. Market Open.
+Date	
+Close	
+Open	
+High	
+Low	
+1D5D1M6MYTD1Y5YAll
+Bank of America (BAC) analyst Brad Sills lowered his price outlook on CoreWeave shares to $140 from $168 apiece, following the results released after market close on Monday.
+
+Meanwhile, the company's adjusted operating income — a measure of how much profit CoreWeave makes from its core operations — was $217 million, below its interest expense of $311 million, noted DA Davidson analyst Gil Luria.
+
+"We continue to believe this business is not worth scaling," Luria wrote in a note to clients.
+
+CoreWeave relies on debt borrowed at high interest rates against its massive store of Nvidia chips — a deteriorating asset — to buy more Nvidia chips to rent out to customers.
+
+Its customers are also some of Nvidia's biggest customers: Microsoft (MSFT) makes up the overwhelming majority of CoreWeave's revenue, raising fears that CoreWeave could go bust once major hyperscalers finish building out AI data centers and as they could eventually rely on their own custom chips rather than Nvidia's.
+
+Nvidia's entangled relationship with CoreWeave has raised eyebrows on Wall Street as analysts begin to question the circular dynamic in AI dealmaking. Nvidia is a major investor in CoreWeave, its biggest supplier, and its customer. The AI chipmaker also has a multibillion-dollar agreement to purchase unsold capacity from the cloud provider.
+
+Allie Canal
+17 mins ago
+Allie Canal
+Amazon Prime Video says its ad tier now reaches 315 million global viewers
+Amazon (AMZN) Prime Video's ad-supported streaming service now reaches more than 315 million viewers worldwide each month, the company said on Tuesday. That's a jump from the 200 million figure the tech megacap shared in April.
+
+Amazon entered the space in January 2024, when it began making all of its Prime Video subscriptions ad-supported by default. It's seen as a key growth engine, as more viewers and streaming platforms from Netflix (NFLX) to Disney (DIS) embrace ad-supported tiers.
+
+Since that time, Amazon has launched advertising for the streaming service in 16 countries, which now include the US, UK, Germany, Japan, and India.
+
+According to Amazon, the 315 million figure represents an unduplicated average monthly active ad-supported audience across its originals; licensed films and series; live sports and events; and free ad-supported channels. The estimate is based on internal data collected from September 2024 to August 2025, with some regional variations due to launch dates.
+
+The milestone "demonstrates our customer-obsessed approach to enhancing the viewing experience while delivering powerful opportunities for brands," said Jeremy Helfand, vice president of Prime Video advertising.
+
+Laura Bratton
+51 mins ago
+Laura Bratton
+Tech leads stocks down at the open
+Tech dragged US stocks down on Tuesday at the open amid renewed fears of an AI bubble.
+
+The Nasdaq Composite (^IXIC) dropped roughly 0.5%, and the S&P 500 (^GSPC) fell below the flat line. The Dow Jones Industrial Average (^DJI), which includes fewer tech stocks, inched up 0.2%.
+
+DJI - Free Realtime Quote
+•
+USD
+(^DJI)
+
+Follow
+View Quote Details
+47,531.88
++163.25
++(0.34%)
+As of 10:29:46 AM EST. Market Open.
+^DJI
+^IXIC
+^GSPC
+Date	
+Close	
+Open	
+High	
+Low	
+1D5D1M6MYTD1Y5YAll
+The market action comes after SoftBank Group (SFTBY) sold its Nvidia (NVDA) stake, and as financial updates from AI chip manufacturer TSMC (TSM) and data center provider CoreWeave (CRWV) disappointed investors.
+
+Today at 3:00 PM GMT+1
+Karen Friar
+AI fueled the stock market rally. Earnings are now giving it staying power.
+Yahoo Finance's Allie Canal reports:
+
+After a year dominated by artificial intelligence headlines, Wall Street’s bull case is shifting toward something more fundamental to stocks: earnings power that’s beginning to broaden beyond Big Tech.
+
+Morgan Stanley, UBS, and other major firms are pointing to a clear throughline this earnings season: Profits are strong, margins are stabilizing, and growth, while still concentrated in AI-heavy tech, is beginning to spread.
+
+“There are clear signs that the earnings recovery is underway and pricing power is firming,” Morgan Stanley equity strategist Mike Wilson wrote in a client note on Monday. ...
+
+FactSet’s latest data backs that up. With more than 90% of S&P 500 (^GSPC) companies reporting, 82% have beaten earnings estimates, while overall profits rose 13.1% year over year. That marks the fourth straight quarter of double-digit growth. ...
+
+SNP - Free Realtime Quote
+•
+USD
+(^GSPC)
+
+Follow
+View Quote Details
+6,812.08
+-20.35
+(-0.30%)
+As of 10:30:13 AM EST. Market Open.
+Date	
+Close	
+Open	
+High	
+Low	
+1D5D1M6MYTD1Y5YAll
+Still, some strategists warn that the trend will need to continue from here.
+
+“Earnings sentiment staged a partial comeback,” RBC Capital Markets strategist Lori Calvasina wrote in a note to clients, adding that while revisions have improved for two straight weeks, they remain “well below” summer highs.
+
+Read more here.
+
+Today at 1:45 PM GMT+1
+Karen Friar
+The bowl crisis indicator flashes red
+Yahoo Finance's Hamza Shaban reports:
+
+You don't need to watch more than a few Chipotle (CMG) "hack" videos to know something is off. The bowls are half full — figuratively speaking.
+
+This earnings season has delivered a strong signal that times are tough for many food service companies. But a major reason behind their flagging operations helps clarify a key storyline in the economy left open ended amid the government shutdown. Young people are feeling greater financial pressure, squeezed by housing costs, a frozen jobs market, and slower wage growth.
+
+Chipotle, the fast-casual go-to, whose stock is down about 50% for the year, was the first of several chains to point to slowing sales tied to cash-strapped consumers. As pricing pressures continue to weigh down wallets, eating out, even at more affordable price points, has become something of a weekly luxury, replacing what used to be a workday routine.
+
+If tech companies with global reach can serve as a barometer of financial health, the onset of what could be described as a burrito malaise is an indicator of fresh price sensitivity. ...
+
+But perceptions of value matter just as much as people's capacity to spend.
+
+Read more here in the takeaway from today's Morning Brief.
+
+Jenny McCall
+Today at 1:41 PM GMT+1
+Jenny McCall
+Good morning. Here's what's happening today.
+Economic data: NFIB small business optimism (Oct.)
+
+Earnings calendar: Sony (SONY), Sea Limited (SE), Alcon (ALC), AngloGold Ashanti (AU), Vodafone Group (VOD), Oklo (OKLO), Fermi (FRMI)
+
+Here are some of the biggest stories you may have missed overnight and early this morning:
+
+The bull case for stocks is broadening beyond AI
+
+SoftBank unloads Nvidia stake for $5.8 billion in surprise move
+
+CoreWeave trims sales outlook on data center delay; stock falls
+
+The bowl crisis indicator flashes red
+
+Democrats trade election euphoria for angst over shutdown deal
+
+China plans to keep its rare earths out of US military hands
+
+Meta chief AI scientist Yann LeCun plans to exit, launch own start-up
+
+Intel CEO to oversee AI efforts after its head quits for OpenAI
+
+Sony ups profit forecast as it dials back tariff hit view
+
+Xpeng stock jumps amid progress on human-like robots
+
+Jenny McCall
+Today at 1:27 PM GMT+1
+Jenny McCall
+Premarket trending tickers: Meta, Beyond Meat and Sony
+Meta (META) stock fell 1% before the bell on Tuesday. The drop in share price follows the news that Meta's chief artificial intelligence scientist Yann LeCun is planning to leave the social media giant to found his own start-up.
+
+Beyond Meat (BYND) stock fell 5% in premarket trading on Tuesday after releasing its delayed earnings report Monday's closing bell.
+
+Sony (SONY) shares rose 5% before the bell after raising its earnings forecast after a stronger than expected second quarter.
+
+Today at 11:40 AM GMT+1
+Grace O'Donnell
+Paramount Skydance stock pops as investors weigh its cost-cut plans
+Paramount Skydance (PSKY) shares rose about 5% in premarket trading on Tuesday as investors digested its third quarter earnings.
+
+Quarterly revenue came in just below Wall Street expectations in the results, released in after hours on Monday. But the company struck an upbeat tone for what lies ahead, raising its cost-savings target, projecting stronger streaming profits, and signaling upcoming price hikes for Paramount+.
+
+Revenue totaled $6.7 billion for the quarter ended in September, slightly shy of analysts’ $7 billion estimate, in the company’s first earnings release since completing its merger with Skydance in August.
+
+Paramount Skydance CEO David Ellison said the company now expects $30 billion in total revenue and $3.5 billion in adjusted OIBDA for 2026, driven by a “healthy acceleration” in streaming. The company also expects Paramount+ to be profitable this year and to grow that profitability in 2026.
+
+Direct-to-consumer revenue jumped 17% year over year, while weakness in TV Media offset those gains. Paramount+ revenue climbed 24%, with total subscribers reaching 79.1 million.
+
+Across the full quarter, Paramount reported $324 million in operating income and a net loss of about $257 million, though pre- and post-merger results aren’t directly comparable.
+
+Ellison said the newly combined company has taken “meaningful steps” to streamline operations, including a reduction of 1,000 employees from its workforce and plans to cut an additional 1,600 employees.
+
+Paramount also raised its efficiency-savings target to $3 billion, up from $2 billion previously.
+
+On top of its efficiency goals, the company also plans to raise prices for Paramount+ early next year in the US, part of a broader push to boost profitability and fund new content and technology investments.
+
+The company recently announced upcoming price increases in both Canada and Australia.
+
+Today at 10:35 AM GMT+1
+Karen Friar
+SoftBank unloads Nvidia stake for $5.8 billion in surprise move
+Shares of Nvidia (NVDA) fell around 1.5% in early trading after SoftBank (SFTBY, 9984.T) offloaded its entire holding in the AI chip giant.
+
+NasdaqGS - Nasdaq Real Time Price
+•
+USD
+(NVDA)
+
+Follow
+View Quote Details
+192.47
+-6.58
+(-3.31%)
+As of 10:30:32 AM EST. Market Open.
+Loading chart for NVDA
+Date	
+Close	
+Open	
+High	
+Low	
+1D5D1M6MYTD1Y5YAll
+Bloomberg reports:
+
+SoftBank Group Corp. sold its entire stake in Nvidia Corp, pocketing $5.8 billion ahead of a rash of planned investments by founder Masayoshi Son to build his own sphere of influence supporting artificial intelligence.
+
+The Tokyo-based company had raised its stake in Nvidia to about $3 billion by the end of March. That stake and a windfall at the Vision Fund startup investment unit helped SoftBank report a surprise net income of ¥2.5 trillion ($16.2 billion) in its fiscal second quarter, far outrunning the average of analyst estimates of ¥418.2 billion. ...
+
+Son’s company now boasts a portfolio that includes some of the world’s most sought-after names in AI: OpenAI (OPAI.PVT) and Oracle Corp. (ORCL). Those stakes boosted SoftBank’s paper gains and helped drive a 78% surge in its share price over the three months ending in September — its best such performance since the December quarter of 2005.
+
+The number of bets from which SoftBank is successfully recouping its investment has increased, “so we raise our forecasts,” Citigroup analyst Keiichi Yoneshima wrote in a note ahead of the earnings release. The analyst set his target price for SoftBank’s stock at ¥27,100, linking his calculations with OpenAI’s valuation and assuming a future valuation range of $500 billion to $1 trillion for the ChatGPT operator.
+
+Tokyo - Delayed Quote
+•
+USD
+(9984.T)
+
+Follow
+View Quote Details
+22,695.00
++440.00
++(1.98%)
+At close: 3:30:00 PM GMT+9
+Loading chart for 9984.T
+Date	
+Close	
+Open	
+High	
+Low	
+1D5D1M6MYTD1Y5YAll
+Read more here.
+
+Today at 4:42 AM GMT+1
+Rian Howlett
+TSMC growth slows in warning sign of AI bubble
+Bloomberg reports:
+
+Taiwan Semiconductor Manufacturing Co. (TSM), posted its slowest monthly revenue growth in more than a year, lending credence to concerns that the artificial intelligence stock rally isn’t justified by the industry’s business prospects.
+
+TSMC, the main chipmaker to AI leader Nvidia Corp., posted a 16.9% rise in sales for October, the slowest pace since February 2024. Still, that tracks with the average analyst estimate for a 16% sales increase in the current quarter. The company has also been grappling with a strengthening local currency that may have affected TSMC’s reported revenue. Its shares stood largely unchanged in Taipei Tuesday.
+
+Industry executives remain buoyant about AI-driven growth as major tech firms are accelerating investments in data centers. The TSMC revenue gain covers just a single month of business, offering investors less insight.
+
+TSMC’s seemingly slower 17% year-over-year October sales growth in local currency doesn’t indicate AI chip demand is cooling. The figure is distorted by 1H order pull-ins and a weaker greenback. In US dollar terms, October revenue climbed 22.6% ($12 billion vs. $9.8 billion), aligning with the midpoint of 4Q guidance.
+- Charles Shum, analyst
+
+Click here for the research.
+
+Still, the market is on edge.
+
+Investors were jolted last week by a sudden slump in Asia’s technology shares, which raised concerns that the world-beating rally in artificial intelligence and semiconductor stocks may be faltering. Wall Street chief executives have warned of an overdue market correction, and Michael Burry’s Scion Asset Management disclosed bearish wagers on Nvidia.
+
+WATCH: TSMC’s slower growth adds fuel to the uncertainty over the sustainability of the AI boom. Matthew Bloxham of Bloomberg Intelligence explains.Source: Bloomberg
+WATCH: TSMC’s slower growth adds fuel to the uncertainty over the sustainability of the AI boom. Matthew Bloxham of Bloomberg Intelligence explains.Source: Bloomberg
+That’s in spite of massive spending plans from leading AI players.
+
+Meta Platforms Inc., Alphabet Inc., Amazon.com Inc. and Microsoft Corp. will collectively spend more than $400 billion to fund an AI buildout next year, a 21% hike from 2025, to secure leadership in the race in emerging technologies.
+
+ 
+Chief Executive Officer Jensen Huang of Nvidia, which is the primary AI chip supplier to major companies, said on Saturday his business is “growing month by month, stronger and stronger.”
+
+Huang met TSMC Chief Executive Officer C.C. Wei and asked for more chip supplies during his two-day whirlwind trip to Taiwan. Major chip designers are all trying to extract more production from the Hsinchu-based company, which is constrained by limited capacity.
+
+TSMC is the go-to chipmaker for the Santa Clara, California-based firm’s competitors including Advanced Micro Devices Inc. and Qualcomm Inc., and it makes Apple Inc.’s silicon for iPhones and other gadgets.
+
+Huang’s optimism is shared by his rivals. Qualcomm Chief Executive Officer Cristiano Amon told Bloomberg TV last week that the world is underestimating how big AI will get.
+
+In October, Wei told analysts that TSMC’s capacity was still very tight and the company is working hard to narrow the gap between demand and supplies.
