@@ -1,0 +1,12 @@
+click==8.3.0
+joblib==1.5.2
+nltk==3.9.2
+random-username==1.0.2
+regex==2025.11.3
+tqdm==4.67.1
+flask
+flask-cors
+nltk
+yfinance
+requests
+pandas
