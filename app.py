@@ -17,6 +17,9 @@ FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
 if not FINNHUB_API_KEY:
     raise RuntimeError("FINNHUB_API_KEY environment variable not set")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+if not ALPHAVANTAGE_API_KEY:
+    raise RuntimeError("ALPHAVANTAGE_API_KEY environment variable not set")
 
 REQUEST_TIMEOUT_SECONDS = 10
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.-]{1,10}$")
@@ -106,19 +109,98 @@ def get_cached_profile(symbol, time_key):
     return finnhub_get("stock/profile2", {"symbol": symbol})
 
 
+def get_time_key_for_resolution(resolution: str):
+    r = resolution.upper()
+    now = datetime.utcnow()
+    if r == "D":
+        return now.strftime("%Y-%m-%d")
+    if r == "W":
+        year, week, _ = now.isocalendar()
+        return f"{year}-W{week}"
+    if r == "M":
+        return now.strftime("%Y-%m")
+    return now.strftime("%Y-%m-%d")
+
+
+ALPHAVANTAGE_FUNCTIONS = {
+    "D": "TIME_SERIES_DAILY",
+    "W": "TIME_SERIES_WEEKLY",
+    "M": "TIME_SERIES_MONTHLY",
+}
+
+
 @lru_cache(maxsize=256)
 def get_cached_candles(symbol, resolution, days, time_key):
     del time_key
-    now = datetime.now(timezone.utc)
-    return finnhub_get(
-        "stock/candle",
-        {
-            "symbol": symbol,
-            "resolution": resolution,
-            "from": int((now - timedelta(days=days)).timestamp()),
-            "to": int(now.timestamp()),
-        },
-    )
+    func = ALPHAVANTAGE_FUNCTIONS.get(resolution.upper())
+    if not func:
+        return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+
+    url = "https://www.alphavantage.co/query"
+    params = {"function": func, "symbol": symbol, "apikey": ALPHAVANTAGE_API_KEY}
+    try:
+        resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code != 200:
+            logger.warning("AlphaVantage non-200 status=%s for symbol=%s func=%s", resp.status_code, symbol, func)
+            return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+        data = resp.json()
+    except Exception:
+        logger.exception("AlphaVantage request failed for symbol=%s func=%s", symbol, func)
+        return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+
+    # Handle rate limit notice or error message
+    if not isinstance(data, dict) or "Note" in data or "Error Message" in data:
+        logger.warning("AlphaVantage returned error/note for symbol=%s func=%s", symbol, func)
+        return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+
+    # Find the time series key dynamically
+    series = None
+    for k, v in data.items():
+        if "Time Series" in k and isinstance(v, dict):
+            series = v
+            break
+
+    if not series:
+        logger.warning("AlphaVantage missing time series for symbol=%s func=%s", symbol, func)
+        return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+
+    # Sort dates ascending
+    try:
+        all_dates = sorted(series.keys())
+    except Exception:
+        logger.exception("Failed sorting AlphaVantage series keys for symbol=%s", symbol)
+        return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+
+    selected = all_dates[-int(days) :] if days > 0 else []
+    timestamps, opens, highs, lows, closes, volumes = [], [], [], [], [], []
+    for date_str in selected:
+        try:
+            # date formats are YYYY-MM-DD for daily/weekly/monthly
+            dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            entry = series.get(date_str, {})
+            o = float(entry.get("1. open") or entry.get("open") or 0)
+            h = float(entry.get("2. high") or entry.get("high") or 0)
+            l = float(entry.get("3. low") or entry.get("low") or 0)
+            c = float(entry.get("4. close") or entry.get("close") or 0)
+            v = int(float(entry.get("5. volume") or entry.get("volume") or 0))
+            timestamps.append(int(dt.timestamp()))
+            opens.append(o)
+            highs.append(h)
+            lows.append(l)
+            closes.append(c)
+            volumes.append(v)
+        except Exception:
+            logger.exception("Failed parsing AlphaVantage entry date=%s symbol=%s", date_str, symbol)
+            continue
+
+    return {
+        "timestamps": timestamps,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+    }
 
 
 @lru_cache(maxsize=512)
@@ -216,9 +298,10 @@ def candles(symbol):
         symbol = validate_symbol(symbol)
         resolution = (request.args.get("resolution") or "D").upper()
         days = int(request.args.get("days", 30))
-        if resolution not in VALID_RESOLUTIONS:
+        # Only support daily/weekly/monthly via Alpha Vantage
+        if resolution not in ALPHAVANTAGE_FUNCTIONS:
             return jsonify({"error": "Invalid resolution"}), 400
-        if not resolution or days < 1 or days > 3650:
+        if days < 1 or days > 3650:
             raise ValueError("Invalid candle parameters")
         logger.info(
             "Incoming symbol=%s resolution=%s days=%s",
@@ -226,7 +309,8 @@ def candles(symbol):
             resolution,
             days,
         )
-        data = get_cached_candles(symbol, resolution, days, int(time.time() // 60))
+        time_key = get_time_key_for_resolution(resolution)
+        data = get_cached_candles(symbol, resolution, days, time_key)
         if data.get("s") != "ok":
             return jsonify(
                 {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
