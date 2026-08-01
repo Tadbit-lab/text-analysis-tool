@@ -144,6 +144,17 @@ def get_cached_candles(symbol, resolution, days, time_key):
             logger.warning("AlphaVantage non-200 status=%s for symbol=%s func=%s", resp.status_code, symbol, func)
             return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
         data = resp.json()
+        logger.info(
+            "AlphaVantage debug symbol=%s func=%s status=%s keys=%s",
+            symbol,
+            func,
+            resp.status_code,
+            list(data.keys()) if isinstance(data, dict) else type(data),
+        )
+        if isinstance(data, dict) and "Note" in data:
+            logger.warning("AlphaVantage NOTE: %s", data.get("Note"))
+        if isinstance(data, dict) and "Error Message" in data:
+            logger.warning("AlphaVantage ERROR: %s", data.get("Error Message"))
     except Exception:
         logger.exception("AlphaVantage request failed for symbol=%s func=%s", symbol, func)
         return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
