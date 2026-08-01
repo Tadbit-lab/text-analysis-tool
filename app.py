@@ -20,6 +20,7 @@ if not FINNHUB_API_KEY:
 
 REQUEST_TIMEOUT_SECONDS = 10
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.-]{1,10}$")
+VALID_RESOLUTIONS = {"1", "5", "15", "30", "60", "D", "W", "M"}
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -215,9 +216,16 @@ def candles(symbol):
         symbol = validate_symbol(symbol)
         resolution = (request.args.get("resolution") or "D").upper()
         days = int(request.args.get("days", 30))
+        if resolution not in VALID_RESOLUTIONS:
+            return jsonify({"error": "Invalid resolution"}), 400
         if not resolution or days < 1 or days > 3650:
             raise ValueError("Invalid candle parameters")
-        logger.info("Incoming symbol=%s", symbol)
+        logger.info(
+            "Incoming symbol=%s resolution=%s days=%s",
+            symbol,
+            resolution,
+            days,
+        )
         data = get_cached_candles(symbol, resolution, days, int(time.time() // 60))
         if data.get("s") != "ok":
             return jsonify(
