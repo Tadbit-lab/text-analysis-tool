@@ -1,2 +1,8 @@
-__pycache__
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.venv/
+venv/__pycache__
 results/*
