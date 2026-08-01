@@ -155,13 +155,20 @@ def get_cached_candles(symbol, resolution, days, time_key):
             logger.warning("AlphaVantage NOTE: %s", data.get("Note"))
         if isinstance(data, dict) and "Error Message" in data:
             logger.warning("AlphaVantage ERROR: %s", data.get("Error Message"))
+        if isinstance(data, dict) and "Information" in data:
+            logger.warning("AlphaVantage INFORMATION: %s", data.get("Information"))
     except Exception:
         logger.exception("AlphaVantage request failed for symbol=%s func=%s", symbol, func)
         return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
 
     # Handle rate limit notice or error message
-    if not isinstance(data, dict) or "Note" in data or "Error Message" in data:
-        logger.warning("AlphaVantage returned error/note for symbol=%s func=%s", symbol, func)
+    if (
+        not isinstance(data, dict)
+        or "Note" in data
+        or "Error Message" in data
+        or "Information" in data
+    ):
+        logger.warning("AlphaVantage returned error/note/information for symbol=%s func=%s", symbol, func)
         return {"timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
 
     # Find the time series key dynamically
