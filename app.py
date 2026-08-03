@@ -1,10 +1,13 @@
+import json
 import logging
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
+import redis
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -30,6 +33,16 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+REDIS_URL = os.getenv("REDIS_URL")
+redis_client = None
+if REDIS_URL:
+    try:
+        redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        redis_client.ping()
+    except Exception as error:
+        logger.warning("Redis unavailable; continuing without cache: %s", error)
+        redis_client = None
 
 app = Flask(__name__, static_folder=None)
 CORS(
@@ -98,10 +111,68 @@ def finnhub_get(endpoint, params):
         raise FinnhubError("Finnhub returned invalid data") from error
 
 
-@lru_cache(maxsize=512)
-def get_cached_quote(symbol, time_key):
-    del time_key
-    return finnhub_get("quote", {"symbol": symbol})
+def get_quote_ttl_seconds():
+    now = datetime.now(ZoneInfo("America/New_York"))
+    market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    return 30 if now.weekday() < 5 and market_open <= now < market_close else 1800
+
+
+def quote_number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_quote_payload(symbol, data=None):
+    quote_data = data if isinstance(data, dict) else {}
+    return {
+        "symbol": symbol,
+        "current_price": quote_number(quote_data.get("c")),
+        "change": quote_number(quote_data.get("d")),
+        "percent_change": quote_number(quote_data.get("dp")),
+        "high": quote_number(quote_data.get("h")),
+        "low": quote_number(quote_data.get("l")),
+        "open": quote_number(quote_data.get("o")),
+        "previous_close": quote_number(quote_data.get("pc")),
+    }
+
+
+def get_cached_quote(symbol):
+    cache_key = f"quote:{symbol}"
+    if redis_client:
+        try:
+            cached_value = redis_client.get(cache_key)
+            if cached_value is not None:
+                parsed_value = json.loads(cached_value)
+                if isinstance(parsed_value, dict):
+                    return parsed_value
+        except Exception as error:
+            logger.warning("Redis quote read failed symbol=%s error=%s", symbol, error)
+
+    try:
+        data = finnhub_get("quote", {"symbol": symbol})
+    except FinnhubError as error:
+        logger.warning("Quote fallback activated symbol=%s error=%s", symbol, error)
+        if redis_client:
+            try:
+                cached_value = redis_client.get(cache_key)
+                if cached_value is not None:
+                    parsed_value = json.loads(cached_value)
+                    if isinstance(parsed_value, dict):
+                        return parsed_value
+            except Exception as redis_error:
+                logger.warning("Redis quote read failed during fallback symbol=%s error=%s", symbol, redis_error)
+        return {}
+
+    if redis_client:
+        try:
+            redis_client.setex(cache_key, get_quote_ttl_seconds(), json.dumps(data))
+        except Exception as error:
+            logger.warning("Redis quote write failed symbol=%s error=%s", symbol, error)
+
+    return data
 
 
 @lru_cache(maxsize=512)
@@ -271,23 +342,13 @@ def quote(symbol):
     try:
         symbol = validate_symbol(symbol)
         logger.info("Incoming symbol=%s", symbol)
-        data = get_cached_quote(symbol, int(time.time() // 10))
-        return jsonify(
-            {
-                "symbol": symbol,
-                "current_price": float(data.get("c", 0)),
-                "change": float(data.get("d", 0)),
-                "percent_change": float(data.get("dp", 0)),
-                "high": float(data.get("h", 0)),
-                "low": float(data.get("l", 0)),
-                "open": float(data.get("o", 0)),
-                "previous_close": float(data.get("pc", 0)),
-            }
-        )
+        data = get_cached_quote(symbol)
+        return jsonify(build_quote_payload(symbol, data))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
     except (FinnhubError, TypeError) as error:
-        return api_error(error)
+        logger.warning("Quote request degraded symbol=%s error=%s", symbol, error)
+        return jsonify(build_quote_payload(symbol, {}))
 
 
 @app.get("/api/profile/<symbol>")
