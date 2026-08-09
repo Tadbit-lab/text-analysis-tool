@@ -5,3 +5,4 @@ python-dotenv
 gunicorn
 redis>=5.0.0
 defeatbeta-api>=0.0.60
+pandas

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -6,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 from threading import Lock
 from zoneinfo import ZoneInfo
 
+import redis
 import requests
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
@@ -13,6 +15,20 @@ from flask_cors import CORS
 
 
 load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Redis client (optional – falls back gracefully if unavailable)
+# ---------------------------------------------------------------------------
+REDIS_URL = os.getenv("REDIS_URL")
+_redis_client = None
+if REDIS_URL:
+    try:
+        _redis_client = redis.from_url(REDIS_URL, decode_responses=True)
+        _redis_client.ping()
+    except Exception as _redis_err:
+        logger_pre = logging.getLogger(__name__)
+        logger_pre.warning("Redis unavailable; continuing without cache: %s", _redis_err)
+        _redis_client = None
 
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
@@ -645,3 +661,275 @@ def news(symbol):
     except (FinnhubError, TypeError, OSError) as error:
         logger.warning("News request degraded symbol=%s error=%s", symbol, error)
         return jsonify([])
+
+
+# ---------------------------------------------------------------------------
+# defeatbeta-api — fundamentals data layer
+# ---------------------------------------------------------------------------
+_DEFEATBETA_AVAILABLE = False
+try:
+    from defeatbeta_api.data.ticker import Ticker as _DefeatbetaTicker  # noqa: E402
+    _DEFEATBETA_AVAILABLE = True
+    logger.info("defeatbeta_api loaded successfully")
+except Exception as _db_import_err:
+    logger.warning("defeatbeta_api unavailable; fundamentals endpoints will return empty: %s", _db_import_err)
+
+_TTL_1DAY = 86400
+_TTL_7DAY = 604800
+
+_EMPTY_FUNDAMENTALS = {"symbol": "", "name": "", "sector": "", "industry": "", "market_cap": 0.0, "pe_ratio": None, "eps": None, "revenue": None, "profit_margin": None, "shares_outstanding": None, "country": "", "description": ""}
+_EMPTY_INCOME = {"symbol": "", "periods": [], "total_revenue": [], "gross_profit": [], "operating_income": [], "net_income": [], "ebitda": []}
+_EMPTY_BALANCE = {"symbol": "", "periods": [], "total_assets": [], "total_liabilities": [], "stockholders_equity": [], "cash_and_equivalents": [], "total_debt": []}
+_EMPTY_CASHFLOW = {"symbol": "", "periods": [], "operating_cash_flow": [], "investing_cash_flow": [], "financing_cash_flow": [], "free_cash_flow": [], "capital_expenditure": []}
+_EMPTY_VALUATION = {"symbol": "", "pe_ratio": None, "pb_ratio": None, "ps_ratio": None, "ev_ebitda": None, "peg_ratio": None, "enterprise_value": None, "market_cap": None}
+_EMPTY_TRANSCRIPTS = {"symbol": "", "transcripts": []}
+
+
+def _df_col(df, *col_candidates):
+    """Return list of floats for the first matching column in *df*, else []."""
+    try:
+        import pandas as pd  # noqa: PLC0415
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+        for col in col_candidates:
+            if col in df.columns:
+                return [None if pd.isna(v) else round(float(v), 4) for v in df[col]]
+        return []
+    except Exception:
+        return []
+
+
+def _df_index(df):
+    """Return the index of a DataFrame as a list of strings."""
+    try:
+        import pandas as pd  # noqa: PLC0415
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            return []
+        return [str(v) for v in df.index.tolist()]
+    except Exception:
+        return []
+
+
+def _safe_ticker(symbol):
+    """Instantiate defeatbeta Ticker or raise RuntimeError."""
+    if not _DEFEATBETA_AVAILABLE:
+        raise RuntimeError("defeatbeta_api not installed")
+    return _DefeatbetaTicker(symbol)
+
+
+def _rget(key):
+    if not _redis_client:
+        return None
+    try:
+        raw = _redis_client.get(key)
+        return json.loads(raw) if raw else None
+    except Exception as err:
+        logger.warning("Redis get failed key=%s err=%s", key, err)
+        return None
+
+
+def _rset(key, value, ttl):
+    if not _redis_client:
+        return
+    try:
+        _redis_client.setex(key, ttl, json.dumps(value))
+    except Exception as err:
+        logger.warning("Redis set failed key=%s err=%s", key, err)
+
+
+def _fundamentals_payload(symbol):
+    t = _safe_ticker(symbol)
+    try:
+        import pandas as pd  # noqa: PLC0415
+        info_df = t.info()
+        row = info_df.iloc[0].to_dict() if isinstance(info_df, pd.DataFrame) and not info_df.empty else {}
+    except Exception:
+        row = {}
+    try:
+        pe = t.ttm_pe()
+        import pandas as pd  # noqa: PLC0415
+        pe_val = float(pe.iloc[0, 0]) if isinstance(pe, pd.DataFrame) and not pe.empty else None
+    except Exception:
+        pe_val = None
+    return {
+        "symbol": symbol,
+        "name": str(row.get("longName") or row.get("shortName") or ""),
+        "sector": str(row.get("sector") or ""),
+        "industry": str(row.get("industry") or ""),
+        "market_cap": float(row["marketCap"]) if row.get("marketCap") else None,
+        "pe_ratio": pe_val,
+        "eps": float(row["trailingEps"]) if row.get("trailingEps") else None,
+        "revenue": float(row["totalRevenue"]) if row.get("totalRevenue") else None,
+        "profit_margin": float(row["profitMargins"]) if row.get("profitMargins") else None,
+        "shares_outstanding": float(row["sharesOutstanding"]) if row.get("sharesOutstanding") else None,
+        "country": str(row.get("country") or ""),
+        "description": str(row.get("longBusinessSummary") or "")[:500],
+    }
+
+
+def _income_payload(symbol):
+    t = _safe_ticker(symbol)
+    df = t.annual_income_statement()
+    import pandas as pd  # noqa: PLC0415
+    try:
+        raw = df.df if hasattr(df, "df") else (df if isinstance(df, pd.DataFrame) else None)
+    except Exception:
+        raw = None
+    return {
+        "symbol": symbol,
+        "periods": _df_index(raw),
+        "total_revenue": _df_col(raw, "Total Revenue", "totalRevenue", "Revenue"),
+        "gross_profit": _df_col(raw, "Gross Profit", "grossProfit"),
+        "operating_income": _df_col(raw, "Operating Income", "operatingIncome", "EBIT"),
+        "net_income": _df_col(raw, "Net Income", "netIncome"),
+        "ebitda": _df_col(raw, "EBITDA", "ebitda"),
+    }
+
+
+def _balance_payload(symbol):
+    t = _safe_ticker(symbol)
+    df = t.annual_balance_sheet()
+    import pandas as pd  # noqa: PLC0415
+    try:
+        raw = df.df if hasattr(df, "df") else (df if isinstance(df, pd.DataFrame) else None)
+    except Exception:
+        raw = None
+    return {
+        "symbol": symbol,
+        "periods": _df_index(raw),
+        "total_assets": _df_col(raw, "Total Assets", "totalAssets"),
+        "total_liabilities": _df_col(raw, "Total Liabilities Net Minority Interest", "totalLiabilities", "Total Liabilities"),
+        "stockholders_equity": _df_col(raw, "Stockholders Equity", "stockholdersEquity", "Total Equity Gross Minority Interest"),
+        "cash_and_equivalents": _df_col(raw, "Cash And Cash Equivalents", "cashAndCashEquivalents", "Cash"),
+        "total_debt": _df_col(raw, "Total Debt", "totalDebt"),
+    }
+
+
+def _cashflow_payload(symbol):
+    t = _safe_ticker(symbol)
+    df = t.annual_cash_flow()
+    import pandas as pd  # noqa: PLC0415
+    try:
+        raw = df.df if hasattr(df, "df") else (df if isinstance(df, pd.DataFrame) else None)
+    except Exception:
+        raw = None
+    return {
+        "symbol": symbol,
+        "periods": _df_index(raw),
+        "operating_cash_flow": _df_col(raw, "Operating Cash Flow", "operatingCashFlow", "Total Cash From Operating Activities"),
+        "investing_cash_flow": _df_col(raw, "Investing Cash Flow", "investingCashFlow", "Total Cashflows From Investing Activities"),
+        "financing_cash_flow": _df_col(raw, "Financing Cash Flow", "financingCashFlow", "Total Cash From Financing Activities"),
+        "free_cash_flow": _df_col(raw, "Free Cash Flow", "freeCashFlow"),
+        "capital_expenditure": _df_col(raw, "Capital Expenditure", "capitalExpenditure", "Capital Expenditures"),
+    }
+
+
+def _valuation_payload(symbol):
+    t = _safe_ticker(symbol)
+    import pandas as pd  # noqa: PLC0415
+
+    def _safe_float(df, col):
+        try:
+            if isinstance(df, pd.DataFrame) and not df.empty and col in df.columns:
+                v = df[col].iloc[0]
+                return None if pd.isna(v) else float(v)
+        except Exception:
+            pass
+        return None
+
+    try:
+        pe_df = t.ttm_pe()
+        pe = float(pe_df.iloc[0, 0]) if isinstance(pe_df, pd.DataFrame) and not pe_df.empty else None
+    except Exception:
+        pe = None
+
+    try:
+        info_df = t.info()
+        row = info_df.iloc[0].to_dict() if isinstance(info_df, pd.DataFrame) and not info_df.empty else {}
+    except Exception:
+        row = {}
+
+    return {
+        "symbol": symbol,
+        "pe_ratio": pe,
+        "pb_ratio": float(row["priceToBook"]) if row.get("priceToBook") else None,
+        "ps_ratio": float(row["priceToSalesTrailing12Months"]) if row.get("priceToSalesTrailing12Months") else None,
+        "ev_ebitda": float(row["enterpriseToEbitda"]) if row.get("enterpriseToEbitda") else None,
+        "peg_ratio": float(row["pegRatio"]) if row.get("pegRatio") else None,
+        "enterprise_value": float(row["enterpriseValue"]) if row.get("enterpriseValue") else None,
+        "market_cap": float(row["marketCap"]) if row.get("marketCap") else None,
+    }
+
+
+def _transcripts_payload(symbol):
+    t = _safe_ticker(symbol)
+    try:
+        raw = t.earning_call_transcripts()
+        items = []
+        transcripts_list = raw.transcripts if hasattr(raw, "transcripts") else (raw if isinstance(raw, list) else [])
+        for item in transcripts_list[:5]:
+            items.append({
+                "date": str(getattr(item, "date", "") or ""),
+                "quarter": str(getattr(item, "quarter", "") or ""),
+                "year": str(getattr(item, "year", "") or ""),
+                "title": str(getattr(item, "title", "") or ""),
+                "summary": str(getattr(item, "content", "") or getattr(item, "summary", "") or "")[:1000],
+            })
+        return {"symbol": symbol, "transcripts": items}
+    except Exception as err:
+        logger.warning("defeatbeta transcripts failed symbol=%s err=%s", symbol, err)
+        return dict(_EMPTY_TRANSCRIPTS, symbol=symbol)
+
+
+def _fundamentals_endpoint(symbol, cache_key_tpl, builder_fn, empty_template, ttl):
+    """Generic handler: Redis → defeatbeta → empty fallback."""
+    try:
+        symbol = validate_symbol(symbol)
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+
+    cache_key = cache_key_tpl.format(symbol=symbol)
+    cached = _rget(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        payload = builder_fn(symbol)
+        _rset(cache_key, payload, ttl)
+        return jsonify(payload)
+    except Exception as err:
+        logger.warning("defeatbeta %s failed symbol=%s err=%s", cache_key_tpl, symbol, err)
+        stale = _rget(cache_key)
+        if stale:
+            return jsonify(stale)
+        return jsonify(dict(empty_template, symbol=symbol))
+
+
+@app.get("/api/fundamentals/<symbol>")
+def fundamentals(symbol):
+    return _fundamentals_endpoint(symbol, "fundamentals:{symbol}", _fundamentals_payload, _EMPTY_FUNDAMENTALS, _TTL_1DAY)
+
+
+@app.get("/api/income/<symbol>")
+def income(symbol):
+    return _fundamentals_endpoint(symbol, "income:{symbol}", _income_payload, _EMPTY_INCOME, _TTL_1DAY)
+
+
+@app.get("/api/balance/<symbol>")
+def balance(symbol):
+    return _fundamentals_endpoint(symbol, "balance:{symbol}", _balance_payload, _EMPTY_BALANCE, _TTL_1DAY)
+
+
+@app.get("/api/cashflow/<symbol>")
+def cashflow(symbol):
+    return _fundamentals_endpoint(symbol, "cashflow:{symbol}", _cashflow_payload, _EMPTY_CASHFLOW, _TTL_1DAY)
+
+
+@app.get("/api/valuation/<symbol>")
+def valuation(symbol):
+    return _fundamentals_endpoint(symbol, "valuation:{symbol}", _valuation_payload, _EMPTY_VALUATION, _TTL_1DAY)
+
+
+@app.get("/api/transcripts/<symbol>")
+def transcripts(symbol):
+    return _fundamentals_endpoint(symbol, "transcripts:{symbol}", _transcripts_payload, _EMPTY_TRANSCRIPTS, _TTL_7DAY)
