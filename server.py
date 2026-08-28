@@ -505,12 +505,10 @@ def get_cached_candles(symbol, resolution, days):
     ttl_seconds = _candle_ttl_seconds(days, resolution)
     with CACHE_LOCK:
         entry = CANDLE_CACHE.get(cache_key)
-        if entry and (ttl_seconds is None or now - entry["fetched_at"] < ttl_seconds):
+        if entry and len(entry.get("data", {}).get("timestamps", [])) > 0 and (ttl_seconds is None or now - entry["fetched_at"] < ttl_seconds):
             return entry["data"]
-        if ttl_seconds is None:
-            return entry["data"] if entry else _get_empty_candle_payload()
         if cache_key in IN_FLIGHT:
-            return entry["data"] if entry else _get_empty_candle_payload()
+            return entry["data"] if entry and len(entry.get("data", {}).get("timestamps", [])) > 0 else _get_empty_candle_payload()
         IN_FLIGHT[cache_key] = now
 
     # 1. Try Twelve Data first
@@ -529,14 +527,12 @@ def get_cached_candles(symbol, resolution, days):
         logger.warning("Candle fallback activated symbol=%s error=%s", symbol, error)
         data = None
 
-    if data is None:
+    if data is None or len(data.get("timestamps", [])) == 0:
         with CACHE_LOCK:
             IN_FLIGHT.pop(cache_key, None)
-            entry = CANDLE_CACHE.get(cache_key)
-            if entry:
-                return entry["data"]
             fallback = _get_empty_candle_payload()
-            CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": fallback}
+            # Do NOT cache empty fallback for long, only 5s to prevent hammering
+            CANDLE_CACHE[cache_key] = {"fetched_at": now - 3595, "data": fallback}
             _prune_cache(CANDLE_CACHE)
             return fallback
 
@@ -763,7 +759,7 @@ def candles(symbol):
         symbol = validate_symbol(symbol)
         resolution = (request.args.get("resolution") or "D").upper()
         days = int(request.args.get("days", 30))
-        if days < 1 or days > 3650:
+        if days < 1 or days > 10000:
             raise ValueError("Invalid candle parameters")
         logger.info(
             "Incoming symbol=%s resolution=%s days=%s",
@@ -771,6 +767,11 @@ def candles(symbol):
             resolution,
             days,
         )
+        force_refresh = request.args.get("forceRefresh") == "true"
+        if force_refresh:
+            cache_key = (symbol.upper(), resolution.upper(), int(days))
+            with CACHE_LOCK:
+                CANDLE_CACHE.pop(cache_key, None)
         data = get_cached_candles(symbol, resolution, days)
         return jsonify(
             {
