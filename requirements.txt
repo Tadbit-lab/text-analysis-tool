@@ -4,5 +4,5 @@ requests
 python-dotenv
 gunicorn
 redis>=5.0.0
-defeatbeta-api>=0.0.60
+yfinance>=0.2.36
 pandas
