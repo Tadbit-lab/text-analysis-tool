@@ -125,33 +125,33 @@ def _quote_ttl_seconds():
 
 def _candle_timeframe(days, resolution):
     normalized = (resolution or "D").upper()
-    if normalized in {"1D", "D"} or days <= 1:
-        return "1D"
-    if normalized in {"1W", "W"} or days <= 7:
-        return "1W"
-    if normalized in {"1M", "M"} or days <= 31:
-        return "1M"
-    if days <= 183:
-        return "6M"
-    if days <= 365:
-        return "1Y"
-    if days <= 1825:
+    if normalized in {"M", "1M"} or days > 1825:
+        return "MAX"
+    if normalized in {"W", "1W"} or days > 365:
         return "5Y"
-    return "MAX"
+    if days > 183:
+        return "1Y"
+    if days > 31:
+        return "6M"
+    if days > 7:
+        return "1M"
+    if days > 1:
+        return "1W"
+    return "1D"
 
 
 def _candle_ttl_seconds(days, resolution):
     timeframe = _candle_timeframe(days, resolution)
-    if timeframe == "1D" and not is_market_open():
-        return None
+    if not is_market_open():
+        return 7200
     return {
         "1D": 300,
-        "1W": 3600,
-        "1M": 21600,
-        "6M": 43200,
-        "1Y": 86400,
-        "5Y": 259200,
-        "MAX": 604800,
+        "1W": 1800,
+        "1M": 3600,
+        "6M": 7200,
+        "1Y": 14400,
+        "5Y": 86400,
+        "MAX": 86400,
     }[timeframe]
 
 
