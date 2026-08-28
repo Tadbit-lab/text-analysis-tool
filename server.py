@@ -31,15 +31,13 @@ if REDIS_URL:
         _redis_client = None
 
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
-if not FINNHUB_API_KEY:
-    raise RuntimeError("FINNHUB_API_KEY environment variable not set")
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
-if not ALPHAVANTAGE_API_KEY:
-    raise RuntimeError("ALPHAVANTAGE_API_KEY environment variable not set")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d7p9q6pr01qlb0a998g0d7p9q6pr01qlb0a998gg")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "UGVO3B6IXPO2ZQZK")
+TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "688fcc792bac433ebc3a9c17649a13d8")
 
 REQUEST_TIMEOUT_SECONDS = 10
-SYMBOL_PATTERN = re.compile(r"^[A-Z0-9.-]{1,10}$")
+SYMBOL_PATTERN = re.compile(r"^[A-Z0-9./:-]{1,15}$")
 VALID_RESOLUTIONS = {"1", "5", "15", "30", "60", "D", "W", "M"}
 MAX_CACHE_ENTRIES = 256
 WATCHLIST_TTL_SECONDS = 300
@@ -48,8 +46,10 @@ PROFILE_CACHE = {}
 CANDLE_CACHE = {}
 WATCHLIST_CACHE = {}
 NEWS_CACHE = {}
+TECHNICALS_CACHE = {}
 CACHE_LOCK = Lock()
 IN_FLIGHT = {}
+
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -190,6 +190,73 @@ def finnhub_get(endpoint, params):
         raise FinnhubError("Finnhub returned invalid data") from error
 
 
+def twelvedata_get(endpoint, params=None):
+    if not TWELVEDATA_API_KEY:
+        logger.error("Twelve Data API key is not configured")
+        return None
+
+    request_params = {**(params or {}), "apikey": TWELVEDATA_API_KEY}
+    url = f"{TWELVEDATA_BASE_URL}/{endpoint}"
+    started_at = time.perf_counter()
+    try:
+        response = requests.get(url, params=request_params, timeout=REQUEST_TIMEOUT_SECONDS)
+        duration_ms = (time.perf_counter() - started_at) * 1000
+        logger.info(
+            "TwelveData API call endpoint=%s status=%s duration_ms=%.2f",
+            endpoint,
+            response.status_code,
+            duration_ms,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and data.get("status") == "error":
+            logger.warning("TwelveData returned error endpoint=%s message=%s", endpoint, data.get("message"))
+            return None
+        return data
+    except Exception as error:
+        logger.warning("TwelveData request failed endpoint=%s error=%s", endpoint, error)
+        return None
+
+
+def fetch_twelvedata_quote(symbol):
+    data = twelvedata_get("quote", {"symbol": symbol})
+    if not data or not isinstance(data, dict) or "close" not in data:
+        # Try alternative format if needed (e.g. BTCUSD -> BTC/USD)
+        if len(symbol) == 6 and not "/" in symbol and ("USD" in symbol or "EUR" in symbol):
+            alt_sym = f"{symbol[:3]}/{symbol[3:]}"
+            data = twelvedata_get("quote", {"symbol": alt_sym})
+    if not data or not isinstance(data, dict) or "close" not in data:
+        return None
+
+    c = float(data.get("close") or 0)
+    d = float(data.get("change") or 0)
+    dp = float(data.get("percent_change") or 0)
+    h = float(data.get("high") or 0)
+    l = float(data.get("low") or 0)
+    o = float(data.get("open") or 0)
+    pc = float(data.get("previous_close") or 0)
+    v = int(float(data.get("volume") or 0))
+    avg_v = int(float(data.get("average_volume") or 0))
+    ftw = data.get("fifty_two_week", {})
+
+    return {
+        "c": c,
+        "d": d,
+        "dp": dp,
+        "h": h,
+        "l": l,
+        "o": o,
+        "pc": pc,
+        "volume": v,
+        "average_volume": avg_v,
+        "fifty_two_week": {
+            "low": float(ftw.get("low") or 0),
+            "high": float(ftw.get("high") or 0),
+            "range": ftw.get("range", ""),
+        },
+    }
+
+
 def get_cached_quote(symbol):
     key = symbol.upper()
     now = time.time()
@@ -201,6 +268,16 @@ def get_cached_quote(symbol):
             return entry["data"] if entry else _get_empty_quote_payload()
         IN_FLIGHT[key] = now
 
+    # 1. Try Twelve Data first
+    td_data = fetch_twelvedata_quote(symbol)
+    if td_data:
+        with CACHE_LOCK:
+            QUOTE_CACHE[key] = {"fetched_at": now, "data": td_data}
+            _prune_cache(QUOTE_CACHE)
+            IN_FLIGHT.pop(key, None)
+        return td_data
+
+    # 2. Fallback to Finnhub
     try:
         data = finnhub_get("quote", {"symbol": symbol})
     except FinnhubError as error:
@@ -364,6 +441,64 @@ def fetch_alpha_vantage_candles(symbol, resolution, days):
     }
 
 
+TWELVEDATA_INTERVALS = {
+    "1": "1min",
+    "5": "5min",
+    "15": "15min",
+    "30": "30min",
+    "60": "1h",
+    "D": "1day",
+    "1D": "1day",
+    "W": "1week",
+    "1W": "1week",
+    "M": "1month",
+    "1M": "1month",
+}
+
+
+def fetch_twelvedata_candles(symbol, resolution, days):
+    interval = TWELVEDATA_INTERVALS.get((resolution or "D").upper(), "1day")
+    size = min(int(days), 5000) if days > 0 else 30
+    outputsize = max(size, 30)
+
+    # Try original symbol first, then format variations (e.g. BTC/USD)
+    data = twelvedata_get("time_series", {"symbol": symbol, "interval": interval, "outputsize": outputsize})
+    if not data or not isinstance(data, dict) or not data.get("values"):
+        if len(symbol) == 6 and not "/" in symbol and ("USD" in symbol or "EUR" in symbol):
+            alt_sym = f"{symbol[:3]}/{symbol[3:]}"
+            data = twelvedata_get("time_series", {"symbol": alt_sym, "interval": interval, "outputsize": outputsize})
+
+    if not data or not isinstance(data, dict) or not data.get("values"):
+        return None
+
+    raw_vals = data["values"][::-1]  # Sort ascending chronologically
+    timestamps, opens, highs, lows, closes, volumes = [], [], [], [], [], []
+    for entry in raw_vals[-size:]:
+        try:
+            dt_str = entry["datetime"]
+            if " " in dt_str:
+                dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+            else:
+                dt = datetime.strptime(dt_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            timestamps.append(int(dt.timestamp()))
+            opens.append(float(entry.get("open") or 0))
+            highs.append(float(entry.get("high") or 0))
+            lows.append(float(entry.get("low") or 0))
+            closes.append(float(entry.get("close") or 0))
+            volumes.append(int(float(entry.get("volume") or 0)))
+        except Exception:
+            continue
+
+    return {
+        "timestamps": timestamps,
+        "open": opens,
+        "high": highs,
+        "low": lows,
+        "close": closes,
+        "volume": volumes,
+    }
+
+
 def get_cached_candles(symbol, resolution, days):
     cache_key = (symbol.upper(), resolution.upper(), int(days))
     now = time.time()
@@ -378,6 +513,16 @@ def get_cached_candles(symbol, resolution, days):
             return entry["data"] if entry else _get_empty_candle_payload()
         IN_FLIGHT[cache_key] = now
 
+    # 1. Try Twelve Data first
+    td_data = fetch_twelvedata_candles(symbol, resolution, days)
+    if td_data and len(td_data.get("timestamps", [])) > 0:
+        with CACHE_LOCK:
+            CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": td_data}
+            _prune_cache(CANDLE_CACHE)
+            IN_FLIGHT.pop(cache_key, None)
+        return td_data
+
+    # 2. Fallback to Alpha Vantage
     try:
         data = fetch_alpha_vantage_candles(symbol, resolution, days)
     except Exception as error:
@@ -414,21 +559,56 @@ def get_cached_watchlist(symbols):
             return entry["data"] if entry else []
         IN_FLIGHT[cache_key] = now
 
+    # Try batched Twelve Data quote
+    batch_str = ",".join(normalized_symbols)
+    td_batch = twelvedata_get("quote", {"symbol": batch_str})
+
     payload = []
-    for symbol in normalized_symbols:
-        quote = get_cached_quote(symbol)
-        payload.append(
-            {
-                "symbol": symbol,
-                "current_price": float(quote.get("c", 0)),
-                "change": float(quote.get("d", 0)),
-                "percent_change": float(quote.get("dp", 0)),
-                "high": float(quote.get("h", 0)),
-                "low": float(quote.get("l", 0)),
-                "open": float(quote.get("o", 0)),
-                "previous_close": float(quote.get("pc", 0)),
-            }
-        )
+    if td_batch and isinstance(td_batch, dict):
+        for sym in normalized_symbols:
+            item = td_batch.get(sym) if isinstance(td_batch.get(sym), dict) else (td_batch if td_batch.get("symbol") == sym else None)
+            if item and "close" in item:
+                payload.append(
+                    {
+                        "symbol": sym,
+                        "current_price": float(item.get("close", 0)),
+                        "change": float(item.get("change", 0)),
+                        "percent_change": float(item.get("percent_change", 0)),
+                        "high": float(item.get("high", 0)),
+                        "low": float(item.get("low", 0)),
+                        "open": float(item.get("open", 0)),
+                        "previous_close": float(item.get("previous_close", 0)),
+                    }
+                )
+            else:
+                q = get_cached_quote(sym)
+                payload.append(
+                    {
+                        "symbol": sym,
+                        "current_price": float(q.get("c", 0)),
+                        "change": float(q.get("d", 0)),
+                        "percent_change": float(q.get("dp", 0)),
+                        "high": float(q.get("h", 0)),
+                        "low": float(q.get("l", 0)),
+                        "open": float(q.get("o", 0)),
+                        "previous_close": float(q.get("pc", 0)),
+                    }
+                )
+    else:
+        for symbol in normalized_symbols:
+            quote = get_cached_quote(symbol)
+            payload.append(
+                {
+                    "symbol": symbol,
+                    "current_price": float(quote.get("c", 0)),
+                    "change": float(quote.get("d", 0)),
+                    "percent_change": float(quote.get("dp", 0)),
+                    "high": float(quote.get("h", 0)),
+                    "low": float(quote.get("l", 0)),
+                    "open": float(quote.get("o", 0)),
+                    "previous_close": float(quote.get("pc", 0)),
+                }
+            )
 
     with CACHE_LOCK:
         WATCHLIST_CACHE[cache_key] = {"fetched_at": now, "data": payload}
@@ -524,6 +704,9 @@ def quote(symbol):
                 "low": float(data.get("l", 0)),
                 "open": float(data.get("o", 0)),
                 "previous_close": float(data.get("pc", 0)),
+                "volume": data.get("volume"),
+                "average_volume": data.get("average_volume"),
+                "fifty_two_week": data.get("fifty_two_week"),
             }
         )
     except ValueError as error:
@@ -580,8 +763,6 @@ def candles(symbol):
         symbol = validate_symbol(symbol)
         resolution = (request.args.get("resolution") or "D").upper()
         days = int(request.args.get("days", 30))
-        if resolution not in ALPHAVANTAGE_FUNCTIONS:
-            return jsonify({"error": "Invalid resolution"}), 400
         if days < 1 or days > 3650:
             raise ValueError("Invalid candle parameters")
         logger.info(
@@ -627,6 +808,170 @@ def watchlist():
     except (FinnhubError, TypeError) as error:
         logger.warning("Watchlist request degraded error=%s", error)
         return jsonify([])
+
+
+@app.get("/api/price/<symbol>")
+def price_lookup(symbol):
+    try:
+        raw_sym = symbol.strip().upper()
+        # Crypto or Forex pair
+        if "/" in raw_sym or ("USD" in raw_sym and len(raw_sym) == 6):
+            formatted_sym = raw_sym if "/" in raw_sym else f"{raw_sym[:3]}/{raw_sym[3:]}"
+            data = twelvedata_get("exchange_rate", {"symbol": formatted_sym})
+            if data and "rate" in data:
+                return jsonify({"symbol": raw_sym, "price": float(data["rate"]), "type": "exchange_rate"})
+        # Stock price
+        data = twelvedata_get("price", {"symbol": raw_sym})
+        if data and "price" in data:
+            return jsonify({"symbol": raw_sym, "price": float(data["price"]), "type": "stock_price"})
+        # Fallback to quote
+        q = get_cached_quote(raw_sym)
+        return jsonify({"symbol": raw_sym, "price": float(q.get("c", 0)), "type": "quote"})
+    except Exception as err:
+        return jsonify({"error": str(err)}), 400
+
+
+@app.get("/api/technicals/<symbol>")
+def technicals(symbol):
+    try:
+        symbol = validate_symbol(symbol)
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+
+    cache_key = f"td:technicals:{symbol}"
+    cached = _rget(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    with CACHE_LOCK:
+        entry = TECHNICALS_CACHE.get(symbol)
+        if entry and time.time() - entry["fetched_at"] < 300:
+            return jsonify(entry["data"])
+
+    # 1. Fetch quote
+    quote_data = get_cached_quote(symbol)
+
+    # 2. Fetch RSI (14)
+    rsi_data = twelvedata_get("rsi", {"symbol": symbol, "interval": "1day", "time_period": 14, "outputsize": 1})
+    rsi_val = None
+    if rsi_data and rsi_data.get("values"):
+        rsi_val = _sf(rsi_data["values"][0].get("rsi"))
+
+    # 3. Fetch MACD
+    macd_data = twelvedata_get("macd", {"symbol": symbol, "interval": "1day", "outputsize": 1})
+    macd_val, macd_signal, macd_hist = None, None, None
+    if macd_data and macd_data.get("values"):
+        v = macd_data["values"][0]
+        macd_val = _sf(v.get("macd"))
+        macd_signal = _sf(v.get("macd_signal"))
+        macd_hist = _sf(v.get("macd_hist"))
+
+    # 4. Fetch 250 candles for SMA calculations & historical returns
+    candles = get_cached_candles(symbol, "D", 260)
+    closes = candles.get("close", []) if candles else []
+
+    sma20 = round(sum(closes[-20:]) / 20, 2) if len(closes) >= 20 else None
+    sma50 = round(sum(closes[-50:]) / 50, 2) if len(closes) >= 50 else None
+    sma200 = round(sum(closes[-200:]) / 200, 2) if len(closes) >= 200 else None
+
+    # Bollinger Bands on 20 periods
+    bb_upper, bb_lower, bb_mid = None, None, None
+    if len(closes) >= 20:
+        c20 = closes[-20:]
+        mean20 = sum(c20) / 20
+        variance = sum((x - mean20) ** 2 for x in c20) / 20
+        std20 = variance ** 0.5
+        bb_upper = round(mean20 + (2 * std20), 2)
+        bb_lower = round(mean20 - (2 * std20), 2)
+        bb_mid = round(mean20, 2)
+
+    current_p = float(quote_data.get("c") or (closes[-1] if closes else 0))
+    ret_1m = round(((current_p - closes[-22]) / closes[-22]) * 100, 2) if len(closes) >= 22 and closes[-22] > 0 else None
+    ret_3m = round(((current_p - closes[-66]) / closes[-66]) * 100, 2) if len(closes) >= 66 and closes[-66] > 0 else None
+    ret_6m = round(((current_p - closes[-132]) / closes[-132]) * 100, 2) if len(closes) >= 132 and closes[-132] > 0 else None
+    ret_1y = round(((current_p - closes[-250]) / closes[-250]) * 100, 2) if len(closes) >= 250 and closes[-250] > 0 else None
+
+    rsi_status = "Neutral"
+    if rsi_val:
+        if rsi_val >= 70:
+            rsi_status = "Overbought"
+        elif rsi_val <= 30:
+            rsi_status = "Oversold"
+
+    macd_status = "Neutral"
+    if macd_hist is not None:
+        macd_status = "Bullish Momentum" if macd_hist > 0 else "Bearish Pressure"
+
+    trend_signal = "Neutral"
+    if current_p and sma50 and sma200:
+        if current_p > sma50 and sma50 > sma200:
+            trend_signal = "Strong Bullish"
+        elif current_p < sma50 and sma50 < sma200:
+            trend_signal = "Strong Bearish"
+        elif current_p > sma50:
+            trend_signal = "Moderate Bullish"
+        else:
+            trend_signal = "Moderate Bearish"
+    elif current_p and sma50:
+        trend_signal = "Bullish Bias" if current_p > sma50 else "Bearish Bias"
+
+    vol_ratio = None
+    v = quote_data.get("volume")
+    avg_v = quote_data.get("average_volume")
+    if v and avg_v and avg_v > 0:
+        vol_ratio = round(v / avg_v, 2)
+
+    payload = {
+        "symbol": symbol,
+        "current_price": current_p,
+        "change": quote_data.get("d"),
+        "percent_change": quote_data.get("dp"),
+        "fifty_two_week": quote_data.get("fifty_two_week"),
+        "volume": v,
+        "average_volume": avg_v,
+        "volume_ratio": vol_ratio,
+        "rsi_14": rsi_val,
+        "rsi_status": rsi_status,
+        "macd": {
+            "value": macd_val,
+            "signal": macd_signal,
+            "histogram": macd_hist,
+            "status": macd_status,
+        },
+        "moving_averages": {
+            "sma_20": sma20,
+            "sma_50": sma50,
+            "sma_200": sma200,
+            "price_vs_sma20": round(((current_p - sma20) / sma20) * 100, 2) if current_p and sma20 else None,
+            "price_vs_sma50": round(((current_p - sma50) / sma50) * 100, 2) if current_p and sma50 else None,
+            "price_vs_sma200": round(((current_p - sma200) / sma200) * 100, 2) if current_p and sma200 else None,
+        },
+        "bollinger_bands": {
+            "upper": bb_upper,
+            "middle": bb_mid,
+            "lower": bb_lower,
+        },
+        "returns": {
+            "return_1m": ret_1m,
+            "return_3m": ret_3m,
+            "return_6m": ret_6m,
+            "return_1y": ret_1y,
+        },
+        "signals": {
+            "trend": trend_signal,
+            "rsi": rsi_status,
+            "macd": macd_status,
+            "golden_cross": True if sma50 and sma200 and sma50 > sma200 else False,
+        },
+        "timestamp": int(time.time()),
+    }
+
+    _rset(cache_key, payload, 300)
+    with CACHE_LOCK:
+        TECHNICALS_CACHE[symbol] = {"fetched_at": time.time(), "data": payload}
+        _prune_cache(TECHNICALS_CACHE)
+    return jsonify(payload)
+
 
 
 @app.get("/api/news/<symbol>")
