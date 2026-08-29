@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuration — API keys must come from environment. No hardcoded defaults.
+# Configuration — API keys from environment
 # ---------------------------------------------------------------------------
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
@@ -39,11 +39,11 @@ ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "")
 TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "")
 
 if not FINNHUB_API_KEY:
-    logger.warning("FINNHUB_API_KEY not set — Finnhub-backed endpoints will degrade")
+    logger.warning("FINNHUB_API_KEY not set — using yfinance fallback for news")
 if not TWELVEDATA_API_KEY:
-    logger.warning("TWELVEDATA_API_KEY not set — TwelveData endpoints will degrade")
+    logger.warning("TWELVEDATA_API_KEY not set — using fallbacks for quotes/candles")
 if not ALPHAVANTAGE_API_KEY:
-    logger.warning("ALPHAVANTAGE_API_KEY not set — AlphaVantage fallback disabled")
+    logger.warning("ALPHAVANTAGE_API_KEY not set")
 
 REQUEST_TIMEOUT_SECONDS = 10
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9./:-]{1,15}$")
@@ -60,9 +60,7 @@ WORDCLOUD_REFRESH_HOUR_ET = 6  # 6 AM Eastern
 WORDCLOUD_MAX_WORDS = 50
 WORDCLOUD_MIN_WORD_LENGTH = 3
 
-# Stopwords — common English + finance/news noise
 STOPWORDS = frozenset({
-    # Standard English
     "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her",
     "was", "one", "our", "out", "day", "get", "has", "him", "his", "how", "man",
     "new", "now", "old", "see", "two", "way", "who", "boy", "did", "its", "let",
@@ -75,7 +73,6 @@ STOPWORDS = frozenset({
     "first", "never", "think", "where", "being", "every", "great", "might",
     "still", "under", "while", "before", "because", "against", "between",
     "during", "through", "without", "within", "around", "again", "another",
-    # News/finance filler
     "reuters", "bloomberg", "cnbc", "reports", "report", "reported", "reporting",
     "says", "saying", "according", "billion", "million", "trillion",
     "percent", "quarter", "quarterly", "fiscal", "year", "years", "yesterday",
@@ -91,7 +88,7 @@ STOPWORDS = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# Redis client (optional – falls back gracefully if unavailable)
+# Redis client
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL")
 _redis_client = None
@@ -187,7 +184,6 @@ def _touch_cache(cache, key):
 
 
 def _sf(val):
-    """Safe float: return float or None (skip NaN/Inf)."""
     try:
         f = float(val)
         return None if math.isnan(f) or math.isinf(f) else f
@@ -243,9 +239,6 @@ def _candle_ttl_seconds(days, resolution):
     }[timeframe]
 
 
-# ---------------------------------------------------------------------------
-# Redis helpers
-# ---------------------------------------------------------------------------
 def _rget(key):
     if not _redis_client:
         return None
@@ -266,12 +259,7 @@ def _rset(key, value, ttl):
         logger.warning("Redis set failed key=%s err=%s", key, err)
 
 
-# ---------------------------------------------------------------------------
-# In-flight guard (context-managed to eliminate leaks)
-# ---------------------------------------------------------------------------
 class InFlightGuard:
-    """Ensures a key is always removed from IN_FLIGHT, even on exceptions."""
-
     def __init__(self, key):
         self.key = key
 
@@ -299,19 +287,13 @@ def finnhub_get(endpoint, params):
     try:
         response = requests.get(url, params=request_params, timeout=REQUEST_TIMEOUT_SECONDS)
         duration_ms = (time.perf_counter() - started_at) * 1000
-        logger.info(
-            "Finnhub API call endpoint=%s status=%s duration_ms=%.2f",
-            endpoint, response.status_code, duration_ms,
-        )
+        logger.info("Finnhub API call endpoint=%s status=%s duration_ms=%.2f", endpoint, response.status_code, duration_ms)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as error:
         duration_ms = (time.perf_counter() - started_at) * 1000
         status_code = getattr(error.response, "status_code", None)
-        logger.error(
-            "Finnhub API failure endpoint=%s status=%s duration_ms=%.2f error_type=%s",
-            endpoint, status_code, duration_ms, type(error).__name__,
-        )
+        logger.error("Finnhub API failure endpoint=%s status=%s duration_ms=%.2f error_type=%s", endpoint, status_code, duration_ms, type(error).__name__)
         raise FinnhubError("Finnhub request failed", status_code) from error
     except ValueError as error:
         logger.error("Finnhub returned invalid JSON endpoint=%s error=%s", endpoint, error)
@@ -328,10 +310,7 @@ def twelvedata_get(endpoint, params=None):
     try:
         response = requests.get(url, params=request_params, timeout=REQUEST_TIMEOUT_SECONDS)
         duration_ms = (time.perf_counter() - started_at) * 1000
-        logger.info(
-            "TwelveData API call endpoint=%s status=%s duration_ms=%.2f",
-            endpoint, response.status_code, duration_ms,
-        )
+        logger.info("TwelveData API call endpoint=%s status=%s duration_ms=%.2f", endpoint, response.status_code, duration_ms)
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict) and data.get("status") == "error":
@@ -371,6 +350,38 @@ def fetch_twelvedata_quote(symbol):
     }
 
 
+def fetch_yfinance_quote(symbol):
+    try:
+        import yfinance as yf
+        t = yf.Ticker(symbol)
+        info = t.fast_info
+        last_price = _sf(info.last_price)
+        prev_close = _sf(info.previous_close)
+        if not last_price:
+            return None
+        change = round(last_price - prev_close, 2) if prev_close else 0.0
+        pct_change = round((change / prev_close) * 100, 2) if prev_close else 0.0
+        return {
+            "c": last_price,
+            "d": change,
+            "dp": pct_change,
+            "h": _sf(info.day_high) or last_price,
+            "l": _sf(info.day_low) or last_price,
+            "o": _sf(info.open) or last_price,
+            "pc": prev_close or last_price,
+            "volume": int(_sf(info.last_volume) or 0),
+            "average_volume": int(_sf(info.three_month_average_volume) or 0),
+            "fifty_two_week": {
+                "low": _sf(info.year_low) or 0.0,
+                "high": _sf(info.year_high) or 0.0,
+                "range": f"{_sf(info.year_low)} - {_sf(info.year_high)}",
+            },
+        }
+    except Exception as e:
+        logger.warning("yfinance quote fallback failed symbol=%s error=%s", symbol, e)
+        return None
+
+
 def get_cached_quote(symbol):
     key = symbol.upper()
     now = time.time()
@@ -393,22 +404,27 @@ def get_cached_quote(symbol):
 
         try:
             data = finnhub_get("quote", {"symbol": symbol})
-        except FinnhubError as error:
-            logger.warning("Quote fallback activated symbol=%s error=%s", symbol, error)
-            with CACHE_LOCK:
-                entry = QUOTE_CACHE.get(key)
-                if entry:
-                    return entry["data"]
-                fallback = _get_empty_quote_payload()
-                QUOTE_CACHE[key] = {"fetched_at": now, "data": fallback}
-                _prune_cache(QUOTE_CACHE)
-                return fallback
+            if data and data.get("c"):
+                with CACHE_LOCK:
+                    QUOTE_CACHE[key] = {"fetched_at": now, "data": data}
+                    _prune_cache(QUOTE_CACHE)
+                return data
+        except FinnhubError:
+            pass
 
-        payload = data or _get_empty_quote_payload()
+        # yfinance zero-key fallback
+        yf_data = fetch_yfinance_quote(symbol)
+        if yf_data:
+            with CACHE_LOCK:
+                QUOTE_CACHE[key] = {"fetched_at": now, "data": yf_data}
+                _prune_cache(QUOTE_CACHE)
+            return yf_data
+
+        fallback = _get_empty_quote_payload()
         with CACHE_LOCK:
-            QUOTE_CACHE[key] = {"fetched_at": now, "data": payload}
+            QUOTE_CACHE[key] = {"fetched_at": now, "data": fallback}
             _prune_cache(QUOTE_CACHE)
-        return payload
+        return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -429,39 +445,51 @@ def get_cached_profile(symbol):
     with InFlightGuard(key):
         try:
             data = finnhub_get("stock/profile2", {"symbol": symbol})
-        except FinnhubError as error:
-            logger.warning("Profile fallback activated symbol=%s error=%s", symbol, error)
+            if data and data.get("name"):
+                payload = {
+                    "name": data.get("name", ""),
+                    "logo": data.get("logo", ""),
+                    "finnhubIndustry": data.get("finnhubIndustry", ""),
+                    "marketCapitalization": _sf(data.get("marketCapitalization")) or 0.0,
+                    "country": data.get("country", ""),
+                }
+                with CACHE_LOCK:
+                    PROFILE_CACHE[key] = {"fetched_at": now, "data": payload}
+                    _prune_cache(PROFILE_CACHE)
+                return payload
+        except FinnhubError:
+            pass
+
+        # yfinance profile fallback
+        try:
+            import yfinance as yf
+            t = yf.Ticker(symbol)
+            info = t.info or {}
+            payload = {
+                "name": info.get("longName") or info.get("shortName") or symbol,
+                "logo": "",
+                "finnhubIndustry": info.get("industry") or info.get("sector") or "",
+                "marketCapitalization": (_sf(info.get("marketCap")) or 0.0) / 1e6,
+                "country": info.get("country") or "",
+            }
             with CACHE_LOCK:
-                entry = PROFILE_CACHE.get(key)
-                if entry:
-                    return entry["data"]
-                fallback = _get_empty_profile_payload()
+                PROFILE_CACHE[key] = {"fetched_at": now, "data": payload}
+                _prune_cache(PROFILE_CACHE)
+            return payload
+        except Exception:
+            fallback = _get_empty_profile_payload()
+            with CACHE_LOCK:
                 PROFILE_CACHE[key] = {"fetched_at": now, "data": fallback}
                 _prune_cache(PROFILE_CACHE)
-                return fallback
-
-        payload = {
-            "name": data.get("name", "") if isinstance(data, dict) else "",
-            "logo": data.get("logo", "") if isinstance(data, dict) else "",
-            "finnhubIndustry": data.get("finnhubIndustry", "") if isinstance(data, dict) else "",
-            "marketCapitalization": _sf(data.get("marketCapitalization")) or 0.0 if isinstance(data, dict) else 0.0,
-            "country": data.get("country", "") if isinstance(data, dict) else "",
-        }
-        with CACHE_LOCK:
-            PROFILE_CACHE[key] = {"fetched_at": now, "data": payload}
-            _prune_cache(PROFILE_CACHE)
-        return payload
+            return fallback
 
 
 # ---------------------------------------------------------------------------
 # Candles
 # ---------------------------------------------------------------------------
 ALPHAVANTAGE_FUNCTIONS = {
-    "D": "TIME_SERIES_DAILY",
-    "W": "TIME_SERIES_WEEKLY",
-    "M": "TIME_SERIES_MONTHLY",
+    "D": "TIME_SERIES_DAILY", "W": "TIME_SERIES_WEEKLY", "M": "TIME_SERIES_MONTHLY",
 }
-
 TWELVEDATA_INTERVALS = {
     "1": "1min", "5": "5min", "15": "15min", "30": "30min", "60": "1h",
     "D": "1day", "1D": "1day", "W": "1week", "1W": "1week", "M": "1month", "1M": "1month",
@@ -470,24 +498,23 @@ TWELVEDATA_INTERVALS = {
 
 def fetch_alpha_vantage_candles(symbol, resolution, days):
     if not ALPHAVANTAGE_API_KEY:
-        return _get_empty_candle_payload()
+        return None
 
     func = ALPHAVANTAGE_FUNCTIONS.get(resolution.upper())
     if not func:
-        return _get_empty_candle_payload()
+        return None
 
     params = {"function": func, "symbol": symbol, "apikey": ALPHAVANTAGE_API_KEY}
     try:
         resp = requests.get(ALPHAVANTAGE_BASE_URL, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
         if resp.status_code != 200:
-            return _get_empty_candle_payload()
+            return None
         data = resp.json()
     except Exception:
-        logger.exception("AlphaVantage request failed for symbol=%s func=%s", symbol, func)
-        return _get_empty_candle_payload()
+        return None
 
     if not isinstance(data, dict) or "Note" in data or "Error Message" in data or "Information" in data:
-        return _get_empty_candle_payload()
+        return None
 
     series = None
     for k, v in data.items():
@@ -496,12 +523,12 @@ def fetch_alpha_vantage_candles(symbol, resolution, days):
             break
 
     if not series:
-        return _get_empty_candle_payload()
+        return None
 
     try:
         all_dates = sorted(series.keys())
     except Exception:
-        return _get_empty_candle_payload()
+        return None
 
     selected = all_dates[-int(days):] if days > 0 else []
     timestamps, opens, highs, lows, closes, volumes = [], [], [], [], [], []
@@ -530,10 +557,7 @@ def fetch_twelvedata_candles(symbol, resolution, days):
     outputsize = max(size, 30)
 
     query_symbol = format_forex_symbol(symbol) if is_forex_pair(symbol) else symbol
-    data = twelvedata_get(
-        "time_series",
-        {"symbol": query_symbol, "interval": interval, "outputsize": outputsize},
-    )
+    data = twelvedata_get("time_series", {"symbol": query_symbol, "interval": interval, "outputsize": outputsize})
 
     if not data or not isinstance(data, dict) or not data.get("values"):
         return None
@@ -543,10 +567,7 @@ def fetch_twelvedata_candles(symbol, resolution, days):
     for entry in raw_vals[-size:]:
         try:
             dt_str = entry["datetime"]
-            if " " in dt_str:
-                dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
-            else:
-                dt = datetime.strptime(dt_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S" if " " in dt_str else "%Y-%m-%d").replace(tzinfo=timezone.utc)
             timestamps.append(int(dt.timestamp()))
             opens.append(_sf(entry.get("open")) or 0.0)
             highs.append(_sf(entry.get("high")) or 0.0)
@@ -560,6 +581,50 @@ def fetch_twelvedata_candles(symbol, resolution, days):
         "timestamps": timestamps,
         "open": opens, "high": highs, "low": lows, "close": closes, "volume": volumes,
     }
+
+
+def fetch_yfinance_candles(symbol, resolution, days):
+    try:
+        import yfinance as yf
+        interval_map = {
+            "1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h",
+            "D": "1d", "1D": "1d", "W": "1wk", "1W": "1wk", "M": "1mo", "1M": "1mo",
+        }
+        yf_interval = interval_map.get((resolution or "D").upper(), "1d")
+        d = max(int(days), 1)
+
+        if yf_interval in ["1m", "5m", "15m", "30m"]:
+            period = f"{min(d, 7)}d"
+        elif d <= 30:
+            period = "1mo"
+        elif d <= 90:
+            period = "3mo"
+        elif d <= 180:
+            period = "6mo"
+        elif d <= 365:
+            period = "1y"
+        elif d <= 1825:
+            period = "5y"
+        else:
+            period = "max"
+
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(period=period, interval=yf_interval)
+        if df is None or df.empty:
+            return None
+
+        timestamps = [int(ts.timestamp()) for ts in df.index]
+        return {
+            "timestamps": timestamps,
+            "open": [round(float(x), 2) for x in df["Open"]],
+            "high": [round(float(x), 2) for x in df["High"]],
+            "low": [round(float(x), 2) for x in df["Low"]],
+            "close": [round(float(x), 2) for x in df["Close"]],
+            "volume": [int(x) for x in df["Volume"]],
+        }
+    except Exception as e:
+        logger.warning("yfinance candle fallback failed symbol=%s error=%s", symbol, e)
+        return None
 
 
 def get_cached_candles(symbol, resolution, days):
@@ -583,23 +648,25 @@ def get_cached_candles(symbol, resolution, days):
                 _prune_cache(CANDLE_CACHE)
             return td_data
 
-        try:
-            data = fetch_alpha_vantage_candles(symbol, resolution, days)
-        except Exception as error:
-            logger.warning("Candle fallback activated symbol=%s error=%s", symbol, error)
-            data = None
-
-        if not data or not data.get("timestamps"):
+        av_data = fetch_alpha_vantage_candles(symbol, resolution, days)
+        if av_data and av_data.get("timestamps"):
             with CACHE_LOCK:
-                fallback = _get_empty_candle_payload()
-                CANDLE_CACHE[cache_key] = {"fetched_at": now - 3595, "data": fallback}
+                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": av_data}
                 _prune_cache(CANDLE_CACHE)
-                return fallback
+            return av_data
 
+        yf_data = fetch_yfinance_candles(symbol, resolution, days)
+        if yf_data and yf_data.get("timestamps"):
+            with CACHE_LOCK:
+                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": yf_data}
+                _prune_cache(CANDLE_CACHE)
+            return yf_data
+
+        fallback = _get_empty_candle_payload()
         with CACHE_LOCK:
-            CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": data}
+            CANDLE_CACHE[cache_key] = {"fetched_at": now - 3595, "data": fallback}
             _prune_cache(CANDLE_CACHE)
-        return data
+        return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -625,12 +692,7 @@ def get_cached_watchlist(symbols):
         payload = []
         if td_batch and isinstance(td_batch, dict):
             for sym in normalized_symbols:
-                item = None
-                if isinstance(td_batch.get(sym), dict):
-                    item = td_batch.get(sym)
-                elif td_batch.get("symbol") == sym:
-                    item = td_batch
-
+                item = td_batch.get(sym) if isinstance(td_batch.get(sym), dict) else (td_batch if td_batch.get("symbol") == sym else None)
                 if item and "close" in item:
                     payload.append({
                         "symbol": sym,
@@ -675,8 +737,32 @@ def get_cached_watchlist(symbols):
 
 
 # ---------------------------------------------------------------------------
-# News
+# News (Finnhub + yfinance fallback)
 # ---------------------------------------------------------------------------
+def fetch_yfinance_news(symbol):
+    try:
+        import yfinance as yf
+        t = yf.Ticker(symbol)
+        yf_news = t.news or []
+        articles = []
+        for item in yf_news:
+            title = item.get("title") or ""
+            summary = item.get("summary") or item.get("description") or ""
+            if title:
+                articles.append({
+                    "headline": title,
+                    "summary": summary,
+                    "source": item.get("publisher", "Yahoo Finance"),
+                    "url": item.get("link", ""),
+                    "datetime": item.get("providerPublishTime", int(time.time())),
+                    "image": (item.get("thumbnail", {}) or {}).get("resolutions", [{}])[0].get("url", "") if isinstance(item.get("thumbnail"), dict) else "",
+                })
+        return articles
+    except Exception as e:
+        logger.warning("yfinance news fallback failed symbol=%s error=%s", symbol, e)
+        return []
+
+
 def get_cached_news(symbol):
     key = symbol.upper()
     now = time.time()
@@ -691,52 +777,42 @@ def get_cached_news(symbol):
 
     with InFlightGuard(key):
         today = datetime.now(timezone.utc).date()
+        articles = []
         try:
             data = finnhub_get(
                 "company-news",
-                {
-                    "symbol": symbol,
-                    "from": (today - timedelta(days=7)).isoformat(),
-                    "to": today.isoformat(),
-                },
+                {"symbol": symbol, "from": (today - timedelta(days=7)).isoformat(), "to": today.isoformat()},
             )
-        except FinnhubError as error:
-            logger.warning("News fallback activated symbol=%s error=%s", symbol, error)
-            with CACHE_LOCK:
-                entry = NEWS_CACHE.get(key)
-                if entry:
-                    return entry["data"]
-                NEWS_CACHE[key] = {"fetched_at": now, "data": []}
-                _prune_cache(NEWS_CACHE)
-                return []
+            if isinstance(data, list) and len(data) > 0:
+                articles = data
+        except FinnhubError:
+            pass
 
-        payload = data if isinstance(data, list) else []
+        # Fallback to yfinance if Finnhub has 0 articles
+        if not articles:
+            articles = fetch_yfinance_news(symbol)
+
         with CACHE_LOCK:
-            NEWS_CACHE[key] = {"fetched_at": now, "data": payload}
+            NEWS_CACHE[key] = {"fetched_at": now, "data": articles}
             _prune_cache(NEWS_CACHE)
-        return payload
+        return articles
 
 
 # ---------------------------------------------------------------------------
 # Word cloud
 # ---------------------------------------------------------------------------
 def _next_wordcloud_refresh_epoch():
-    """Return the next 6 AM ET timestamp (epoch seconds)."""
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    refresh_today = now_et.replace(
-        hour=WORDCLOUD_REFRESH_HOUR_ET, minute=0, second=0, microsecond=0
-    )
+    refresh_today = now_et.replace(hour=WORDCLOUD_REFRESH_HOUR_ET, minute=0, second=0, microsecond=0)
     next_refresh = refresh_today if now_et < refresh_today else refresh_today + timedelta(days=1)
     return next_refresh.timestamp()
 
 
 def _wordcloud_ttl_seconds():
-    """Seconds until next 6 AM ET refresh."""
     return max(int(_next_wordcloud_refresh_epoch() - time.time()), 60)
 
 
 def _tokenize_text(text):
-    """Split text into clean lowercase word tokens."""
     if not text:
         return []
     cleaned = re.sub(r"http\S+|www\.\S+", " ", text)
@@ -746,7 +822,6 @@ def _tokenize_text(text):
 
 
 def _build_wordcloud_from_articles(articles, ticker):
-    """Generate a word-frequency list from news article headlines + summaries."""
     ticker_lower = ticker.lower()
     counter = Counter()
 
@@ -780,37 +855,31 @@ def _build_wordcloud_from_articles(articles, ticker):
 
 
 def get_cached_wordcloud(symbol):
-    """Get word cloud from Redis or memory, refreshed daily at 6 AM ET."""
     key = symbol.upper()
     redis_key = f"wc:news:{key}"
     now = time.time()
     next_refresh = _next_wordcloud_refresh_epoch()
 
-    # Check Redis first (cross-worker consistency)
     cached = _rget(redis_key)
-    if cached and cached.get("expires_at", 0) > now:
+    # Only return cache if it contains actual words and hasn't expired
+    if cached and cached.get("words") and cached.get("expires_at", 0) > now:
         with CACHE_LOCK:
             WORDCLOUD_CACHE[key] = {"fetched_at": now, "data": cached}
             _prune_cache(WORDCLOUD_CACHE)
         return cached
 
-    # Check in-memory cache
     with CACHE_LOCK:
         entry = WORDCLOUD_CACHE.get(key)
-        if entry and entry["data"].get("expires_at", 0) > now:
+        if entry and entry["data"].get("words") and entry["data"].get("expires_at", 0) > now:
             _touch_cache(WORDCLOUD_CACHE, key)
             return entry["data"]
         if key in IN_FLIGHT:
             return entry["data"] if entry else {
-                "symbol": symbol,
-                "words": [],
-                "article_count": 0,
-                "generated_at": int(now),
-                "expires_at": int(next_refresh),
+                "symbol": symbol, "words": [], "article_count": 0,
+                "generated_at": int(now), "expires_at": int(next_refresh),
             }
 
     with InFlightGuard(key):
-        # Reuse existing news cache — no extra Finnhub call needed
         articles = get_cached_news(symbol)
         words = _build_wordcloud_from_articles(articles, symbol)
 
@@ -820,12 +889,12 @@ def get_cached_wordcloud(symbol):
             "article_count": len(articles) if isinstance(articles, list) else 0,
             "generated_at": int(now),
             "expires_at": int(next_refresh),
-            "next_refresh_iso": datetime.fromtimestamp(
-                next_refresh, ZoneInfo("America/New_York")
-            ).isoformat(),
+            "next_refresh_iso": datetime.fromtimestamp(next_refresh, ZoneInfo("America/New_York")).isoformat(),
         }
 
-        _rset(redis_key, payload, _wordcloud_ttl_seconds())
+        # If words were found, cache until 6 AM ET. If empty, cache for 60s to allow retries.
+        cache_ttl = _wordcloud_ttl_seconds() if words else 60
+        _rset(redis_key, payload, cache_ttl)
         with CACHE_LOCK:
             WORDCLOUD_CACHE[key] = {"fetched_at": now, "data": payload}
             _prune_cache(WORDCLOUD_CACHE)
@@ -852,7 +921,7 @@ def internal_server_error(_error):
 
 
 # ---------------------------------------------------------------------------
-# Basic routes
+# Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/")
 def index():
@@ -868,9 +937,6 @@ def health_check():
     })
 
 
-# ---------------------------------------------------------------------------
-# Quote / Profile / Candles routes
-# ---------------------------------------------------------------------------
 @app.get("/api/quote/<symbol>")
 def quote(symbol):
     try:
@@ -891,13 +957,9 @@ def quote(symbol):
         })
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
-    except (FinnhubError, TypeError) as error:
+    except Exception as error:
         logger.warning("Quote request degraded symbol=%s error=%s", symbol, error)
-        return jsonify({
-            "symbol": symbol,
-            "current_price": 0.0, "change": 0.0, "percent_change": 0.0,
-            "high": 0.0, "low": 0.0, "open": 0.0, "previous_close": 0.0,
-        })
+        return jsonify({"symbol": symbol, "current_price": 0.0, "change": 0.0, "percent_change": 0.0, "high": 0.0, "low": 0.0, "open": 0.0, "previous_close": 0.0})
 
 
 @app.get("/api/profile/<symbol>")
@@ -914,7 +976,7 @@ def profile(symbol):
         })
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
-    except (FinnhubError, TypeError) as error:
+    except Exception as error:
         logger.warning("Profile request degraded symbol=%s error=%s", symbol, error)
         return jsonify({"name": "", "logo": "", "industry": "", "market_cap": 0.0, "country": ""})
 
@@ -931,8 +993,7 @@ def candles(symbol):
         if days < 1 or days > 10000:
             raise ValueError("Invalid days parameter (1-10000)")
 
-        force_refresh = request.args.get("forceRefresh") == "true"
-        if force_refresh:
+        if request.args.get("forceRefresh") == "true":
             cache_key = (symbol.upper(), resolution, days)
             with CACHE_LOCK:
                 CANDLE_CACHE.pop(cache_key, None)
@@ -947,9 +1008,7 @@ def candles(symbol):
         for ts in raw_timestamps:
             try:
                 dt = datetime.fromtimestamp(int(ts), tz)
-                formatted_date_strings.append(
-                    dt.strftime("%Y-%m-%d %H:%M") if use_et else dt.strftime("%Y-%m-%d")
-                )
+                formatted_date_strings.append(dt.strftime("%Y-%m-%d %H:%M") if use_et else dt.strftime("%Y-%m-%d"))
             except Exception:
                 formatted_date_strings.append("")
 
@@ -969,12 +1028,9 @@ def candles(symbol):
         })
     except (ValueError, TypeError) as error:
         return jsonify({"error": str(error)}), 400
-    except FinnhubError as error:
+    except Exception as error:
         logger.warning("Candle request degraded symbol=%s error=%s", symbol, error)
-        return jsonify({
-            "c": [], "h": [], "l": [], "o": [], "v": [], "t": [],
-            "timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": [],
-        })
+        return jsonify({"c": [], "h": [], "l": [], "o": [], "v": [], "t": [], "timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []})
 
 
 @app.get("/api/watchlist")
@@ -989,7 +1045,7 @@ def watchlist():
         return jsonify(get_cached_watchlist(symbols))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
-    except (FinnhubError, TypeError) as error:
+    except Exception as error:
         logger.warning("Watchlist request degraded error=%s", error)
         return jsonify([])
 
@@ -1012,9 +1068,6 @@ def price_lookup(symbol):
         return jsonify({"error": str(err)}), 400
 
 
-# ---------------------------------------------------------------------------
-# Technicals (parallelized)
-# ---------------------------------------------------------------------------
 @app.get("/api/technicals/<symbol>")
 def technicals(symbol):
     try:
@@ -1035,14 +1088,8 @@ def technicals(symbol):
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_quote = pool.submit(get_cached_quote, symbol)
-        f_rsi = pool.submit(
-            twelvedata_get, "rsi",
-            {"symbol": symbol, "interval": "1day", "time_period": 14, "outputsize": 1},
-        )
-        f_macd = pool.submit(
-            twelvedata_get, "macd",
-            {"symbol": symbol, "interval": "1day", "outputsize": 1},
-        )
+        f_rsi = pool.submit(twelvedata_get, "rsi", {"symbol": symbol, "interval": "1day", "time_period": 14, "outputsize": 1})
+        f_macd = pool.submit(twelvedata_get, "macd", {"symbol": symbol, "interval": "1day", "outputsize": 1})
         f_candles = pool.submit(get_cached_candles, symbol, "D", 260)
 
         quote_data = f_quote.result() or {}
@@ -1162,9 +1209,6 @@ def technicals(symbol):
     return jsonify(payload)
 
 
-# ---------------------------------------------------------------------------
-# News
-# ---------------------------------------------------------------------------
 @app.get("/api/news/<symbol>")
 def news(symbol):
     try:
@@ -1182,22 +1226,17 @@ def news(symbol):
                 "url": a.get("url", ""),
                 "image": a.get("image", ""),
                 "summary": a.get("summary", ""),
-                "published": datetime.fromtimestamp(
-                    a.get("datetime", 0), timezone.utc
-                ).strftime("%Y-%m-%d %H:%M"),
+                "published": datetime.fromtimestamp(a.get("datetime", 0), timezone.utc).strftime("%Y-%m-%d %H:%M"),
             }
             for a in valid_articles[:5]
         ])
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
-    except (FinnhubError, TypeError, OSError) as error:
+    except Exception as error:
         logger.warning("News request degraded symbol=%s error=%s", symbol, error)
         return jsonify([])
 
 
-# ---------------------------------------------------------------------------
-# Word cloud
-# ---------------------------------------------------------------------------
 @app.get("/api/wordcloud/<symbol>")
 def wordcloud(symbol):
     try:
@@ -1206,7 +1245,6 @@ def wordcloud(symbol):
         return jsonify({"error": str(error)}), 400
 
     try:
-        # Optional manual refresh via ?forceRefresh=true
         if request.args.get("forceRefresh") == "true":
             key = symbol.upper()
             with CACHE_LOCK:
@@ -1234,20 +1272,9 @@ def wordcloud(symbol):
 # Fundamentals & Valuation
 # ---------------------------------------------------------------------------
 _TTL_1DAY = 86400
-
-_EMPTY_FUNDAMENTALS = {
-    "symbol": "", "name": "", "sector": "", "industry": "",
-    "market_cap": None, "pe_ratio": None, "eps": None, "revenue": None,
-    "profit_margin": None, "shares_outstanding": None, "country": "", "description": "",
-}
-_EMPTY_INCOME = {
-    "symbol": "", "periods": [], "total_revenue": [], "gross_profit": [],
-    "operating_income": [], "net_income": [], "ebitda": [], "synthetic": False,
-}
-_EMPTY_VALUATION = {
-    "symbol": "", "pe_ratio": None, "pb_ratio": None, "ps_ratio": None,
-    "ev_ebitda": None, "peg_ratio": None, "enterprise_value": None, "market_cap": None,
-}
+_EMPTY_FUNDAMENTALS = {"symbol": "", "name": "", "sector": "", "industry": "", "market_cap": None, "pe_ratio": None, "eps": None, "revenue": None, "profit_margin": None, "shares_outstanding": None, "country": "", "description": ""}
+_EMPTY_INCOME = {"symbol": "", "periods": [], "total_revenue": [], "gross_profit": [], "operating_income": [], "net_income": [], "ebitda": [], "synthetic": False}
+_EMPTY_VALUATION = {"symbol": "", "pe_ratio": None, "pb_ratio": None, "ps_ratio": None, "ev_ebitda": None, "peg_ratio": None, "enterprise_value": None, "market_cap": None}
 
 
 def _get_finnhub_metrics(symbol):
@@ -1428,32 +1455,19 @@ def _fundamentals_endpoint(symbol, cache_key_tpl, builder_fn, empty_template, tt
 
 @app.get("/api/fundamentals/<symbol>")
 def fundamentals(symbol):
-    return _fundamentals_endpoint(
-        symbol, "fin:fundamentals:{symbol}", _fundamentals_payload, _EMPTY_FUNDAMENTALS, _TTL_1DAY,
-    )
+    return _fundamentals_endpoint(symbol, "fin:fundamentals:{symbol}", _fundamentals_payload, _EMPTY_FUNDAMENTALS, _TTL_1DAY)
 
 
 @app.get("/api/income/<symbol>")
 def income(symbol):
-    return _fundamentals_endpoint(
-        symbol, "fin:income:{symbol}", _income_payload, _EMPTY_INCOME, _TTL_1DAY,
-    )
+    return _fundamentals_endpoint(symbol, "fin:income:{symbol}", _income_payload, _EMPTY_INCOME, _TTL_1DAY)
 
 
 @app.get("/api/valuation/<symbol>")
 def valuation(symbol):
-    return _fundamentals_endpoint(
-        symbol, "fin:valuation:{symbol}", _valuation_payload, _EMPTY_VALUATION, _TTL_1DAY,
-    )
+    return _fundamentals_endpoint(symbol, "fin:valuation:{symbol}", _valuation_payload, _EMPTY_VALUATION, _TTL_1DAY)
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=os.getenv("FLASK_DEBUG", "False") == "True",
-    )
+    app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "False") == "True")
