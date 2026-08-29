@@ -4,7 +4,7 @@ import math
 import os
 import re
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Lock
@@ -54,6 +54,43 @@ WATCHLIST_TTL_SECONDS = 300
 FOREX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY", "HKD", "SGD"}
 
 # ---------------------------------------------------------------------------
+# Word cloud configuration
+# ---------------------------------------------------------------------------
+WORDCLOUD_REFRESH_HOUR_ET = 6  # 6 AM Eastern
+WORDCLOUD_MAX_WORDS = 50
+WORDCLOUD_MIN_WORD_LENGTH = 3
+
+# Stopwords — common English + finance/news noise
+STOPWORDS = frozenset({
+    # Standard English
+    "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her",
+    "was", "one", "our", "out", "day", "get", "has", "him", "his", "how", "man",
+    "new", "now", "old", "see", "two", "way", "who", "boy", "did", "its", "let",
+    "put", "say", "she", "too", "use", "that", "with", "have", "this", "will",
+    "your", "from", "they", "know", "want", "been", "good", "much", "some",
+    "time", "very", "when", "come", "here", "just", "like", "long", "make",
+    "many", "over", "such", "take", "than", "them", "well", "were", "what",
+    "would", "there", "their", "which", "about", "could", "other", "these",
+    "into", "more", "only", "also", "then", "said", "each", "should", "after",
+    "first", "never", "think", "where", "being", "every", "great", "might",
+    "still", "under", "while", "before", "because", "against", "between",
+    "during", "through", "without", "within", "around", "again", "another",
+    # News/finance filler
+    "reuters", "bloomberg", "cnbc", "reports", "report", "reported", "reporting",
+    "says", "saying", "according", "billion", "million", "trillion",
+    "percent", "quarter", "quarterly", "fiscal", "year", "years", "yesterday",
+    "today", "tomorrow", "week", "month", "monday", "tuesday", "wednesday",
+    "thursday", "friday", "company", "companies", "inc", "corp", "corporation",
+    "ltd", "llc", "ceo", "cfo", "cto", "stock", "stocks", "share", "shares",
+    "market", "markets", "trading", "trade", "trader", "traders", "price",
+    "prices", "investor", "investors", "analyst", "analysts", "wall", "street",
+    "news", "update", "updates", "story", "stories", "article", "articles",
+    "read", "click", "photo", "image", "video", "watch", "listen",
+    "amid", "amidst", "however", "although", "though", "thus", "hence",
+    "therefore", "moreover", "furthermore", "meanwhile", "including",
+})
+
+# ---------------------------------------------------------------------------
 # Redis client (optional – falls back gracefully if unavailable)
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL")
@@ -76,6 +113,7 @@ CANDLE_CACHE = OrderedDict()
 WATCHLIST_CACHE = OrderedDict()
 NEWS_CACHE = OrderedDict()
 TECHNICALS_CACHE = OrderedDict()
+WORDCLOUD_CACHE = OrderedDict()
 CACHE_LOCK = Lock()
 IN_FLIGHT = {}
 
@@ -118,13 +156,11 @@ def validate_symbol(symbol):
 
 
 def is_forex_pair(symbol):
-    """Strict forex detection: 6-char code with both halves in known currency set."""
     s = symbol.replace("/", "")
     return len(s) == 6 and s[:3] in FOREX_CURRENCIES and s[3:] in FOREX_CURRENCIES
 
 
 def format_forex_symbol(symbol):
-    """Return 'EUR/USD' style formatting for TwelveData."""
     s = symbol.replace("/", "")
     return f"{s[:3]}/{s[3:]}"
 
@@ -139,13 +175,11 @@ def is_market_open():
 
 
 def _prune_cache(cache):
-    """LRU eviction: OrderedDict.popitem(last=False) removes oldest."""
     while len(cache) > MAX_CACHE_ENTRIES:
         cache.popitem(last=False)
 
 
 def _touch_cache(cache, key):
-    """Move key to end (most-recently used)."""
     try:
         cache.move_to_end(key)
     except KeyError:
@@ -204,13 +238,8 @@ def _candle_ttl_seconds(days, resolution):
     if not is_market_open():
         return 7200
     return {
-        "1D": 300,
-        "1W": 1800,
-        "1M": 3600,
-        "6M": 7200,
-        "1Y": 14400,
-        "5Y": 86400,
-        "MAX": 86400,
+        "1D": 300, "1W": 1800, "1M": 3600, "6M": 7200,
+        "1Y": 14400, "5Y": 86400, "MAX": 86400,
     }[timeframe]
 
 
@@ -434,14 +463,8 @@ ALPHAVANTAGE_FUNCTIONS = {
 }
 
 TWELVEDATA_INTERVALS = {
-    "1": "1min",
-    "5": "5min",
-    "15": "15min",
-    "30": "30min",
-    "60": "1h",
-    "D": "1day", "1D": "1day",
-    "W": "1week", "1W": "1week",
-    "M": "1month", "1M": "1month",
+    "1": "1min", "5": "5min", "15": "15min", "30": "30min", "60": "1h",
+    "D": "1day", "1D": "1day", "W": "1week", "1W": "1week", "M": "1month", "1M": "1month",
 }
 
 
@@ -695,6 +718,122 @@ def get_cached_news(symbol):
 
 
 # ---------------------------------------------------------------------------
+# Word cloud
+# ---------------------------------------------------------------------------
+def _next_wordcloud_refresh_epoch():
+    """Return the next 6 AM ET timestamp (epoch seconds)."""
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    refresh_today = now_et.replace(
+        hour=WORDCLOUD_REFRESH_HOUR_ET, minute=0, second=0, microsecond=0
+    )
+    next_refresh = refresh_today if now_et < refresh_today else refresh_today + timedelta(days=1)
+    return next_refresh.timestamp()
+
+
+def _wordcloud_ttl_seconds():
+    """Seconds until next 6 AM ET refresh."""
+    return max(int(_next_wordcloud_refresh_epoch() - time.time()), 60)
+
+
+def _tokenize_text(text):
+    """Split text into clean lowercase word tokens."""
+    if not text:
+        return []
+    cleaned = re.sub(r"http\S+|www\.\S+", " ", text)
+    cleaned = re.sub(r"&[a-z]+;", " ", cleaned)
+    cleaned = re.sub(r"[^a-zA-Z\s'-]", " ", cleaned)
+    return [w.lower().strip("'-") for w in cleaned.split() if w.strip("'-")]
+
+
+def _build_wordcloud_from_articles(articles, ticker):
+    """Generate a word-frequency list from news article headlines + summaries."""
+    ticker_lower = ticker.lower()
+    counter = Counter()
+
+    for article in articles or []:
+        headline = article.get("headline", "") or ""
+        summary = article.get("summary", "") or ""
+        combined = f"{headline} {summary}"
+
+        for token in _tokenize_text(combined):
+            if len(token) < WORDCLOUD_MIN_WORD_LENGTH:
+                continue
+            if token in STOPWORDS:
+                continue
+            if token == ticker_lower:
+                continue
+            if token.isdigit():
+                continue
+            counter[token] += 1
+
+    top = counter.most_common(WORDCLOUD_MAX_WORDS)
+    max_count = top[0][1] if top else 1
+
+    return [
+        {
+            "text": word,
+            "value": count,
+            "weight": round(count / max_count, 3),
+        }
+        for word, count in top
+    ]
+
+
+def get_cached_wordcloud(symbol):
+    """Get word cloud from Redis or memory, refreshed daily at 6 AM ET."""
+    key = symbol.upper()
+    redis_key = f"wc:news:{key}"
+    now = time.time()
+    next_refresh = _next_wordcloud_refresh_epoch()
+
+    # Check Redis first (cross-worker consistency)
+    cached = _rget(redis_key)
+    if cached and cached.get("expires_at", 0) > now:
+        with CACHE_LOCK:
+            WORDCLOUD_CACHE[key] = {"fetched_at": now, "data": cached}
+            _prune_cache(WORDCLOUD_CACHE)
+        return cached
+
+    # Check in-memory cache
+    with CACHE_LOCK:
+        entry = WORDCLOUD_CACHE.get(key)
+        if entry and entry["data"].get("expires_at", 0) > now:
+            _touch_cache(WORDCLOUD_CACHE, key)
+            return entry["data"]
+        if key in IN_FLIGHT:
+            return entry["data"] if entry else {
+                "symbol": symbol,
+                "words": [],
+                "article_count": 0,
+                "generated_at": int(now),
+                "expires_at": int(next_refresh),
+            }
+
+    with InFlightGuard(key):
+        # Reuse existing news cache — no extra Finnhub call needed
+        articles = get_cached_news(symbol)
+        words = _build_wordcloud_from_articles(articles, symbol)
+
+        payload = {
+            "symbol": symbol,
+            "words": words,
+            "article_count": len(articles) if isinstance(articles, list) else 0,
+            "generated_at": int(now),
+            "expires_at": int(next_refresh),
+            "next_refresh_iso": datetime.fromtimestamp(
+                next_refresh, ZoneInfo("America/New_York")
+            ).isoformat(),
+        }
+
+        _rset(redis_key, payload, _wordcloud_ttl_seconds())
+        with CACHE_LOCK:
+            WORDCLOUD_CACHE[key] = {"fetched_at": now, "data": payload}
+            _prune_cache(WORDCLOUD_CACHE)
+
+        return payload
+
+
+# ---------------------------------------------------------------------------
 # Error handlers
 # ---------------------------------------------------------------------------
 @app.errorhandler(404)
@@ -801,7 +940,6 @@ def candles(symbol):
         data = get_cached_candles(symbol, resolution, days)
 
         raw_timestamps = data.get("timestamps", [])
-        # Intraday resolutions display in ET; daily+ displays in UTC date
         use_et = resolution in {"1", "5", "15", "30", "60"}
         tz = ZoneInfo("America/New_York") if use_et else timezone.utc
 
@@ -816,14 +954,12 @@ def candles(symbol):
                 formatted_date_strings.append("")
 
         return jsonify({
-            # Short keys for frontend canvas rendering
             "c": data.get("close", []),
             "h": data.get("high", []),
             "l": data.get("low", []),
             "o": data.get("open", []),
             "v": data.get("volume", []),
             "t": formatted_date_strings,
-            # Legacy verbose keys
             "timestamps": raw_timestamps,
             "open": data.get("open", []),
             "high": data.get("high", []),
@@ -897,7 +1033,6 @@ def technicals(symbol):
             _touch_cache(TECHNICALS_CACHE, symbol)
             return jsonify(entry["data"])
 
-    # Parallelize the four external calls
     with ThreadPoolExecutor(max_workers=4) as pool:
         f_quote = pool.submit(get_cached_quote, symbol)
         f_rsi = pool.submit(
@@ -1061,6 +1196,41 @@ def news(symbol):
 
 
 # ---------------------------------------------------------------------------
+# Word cloud
+# ---------------------------------------------------------------------------
+@app.get("/api/wordcloud/<symbol>")
+def wordcloud(symbol):
+    try:
+        symbol = validate_symbol(symbol)
+    except ValueError as error:
+        return jsonify({"error": str(error)}), 400
+
+    try:
+        # Optional manual refresh via ?forceRefresh=true
+        if request.args.get("forceRefresh") == "true":
+            key = symbol.upper()
+            with CACHE_LOCK:
+                WORDCLOUD_CACHE.pop(key, None)
+            if _redis_client:
+                try:
+                    _redis_client.delete(f"wc:news:{key}")
+                except Exception:
+                    pass
+
+        payload = get_cached_wordcloud(symbol)
+        return jsonify(payload)
+    except Exception as error:
+        logger.warning("Wordcloud request degraded symbol=%s error=%s", symbol, error)
+        return jsonify({
+            "symbol": symbol,
+            "words": [],
+            "article_count": 0,
+            "generated_at": int(time.time()),
+            "expires_at": int(_next_wordcloud_refresh_epoch()),
+        })
+
+
+# ---------------------------------------------------------------------------
 # Fundamentals & Valuation
 # ---------------------------------------------------------------------------
 _TTL_1DAY = 86400
@@ -1105,7 +1275,6 @@ def _fundamentals_payload(symbol):
     if not description:
         description = f"{profile.get('name', symbol)} operates in the {profile.get('finnhubIndustry', 'global market')} sector."
 
-    # Finnhub returns market cap in millions
     market_cap_raw = _sf(metrics.get("marketCapitalization")) or _sf(profile.get("marketCapitalization"))
     market_cap = market_cap_raw * 1e6 if market_cap_raw else None
 
@@ -1166,7 +1335,6 @@ def _income_payload(symbol):
     except Exception as err:
         logger.warning("yfinance income failed symbol=%s err=%s", symbol, err)
 
-    # Explicitly flagged synthetic fallback
     profile = get_cached_profile(symbol)
     metrics = _get_finnhub_metrics(symbol)
     market_cap_raw = _sf(metrics.get("marketCapitalization")) or _sf(profile.get("marketCapitalization")) or 1e5
