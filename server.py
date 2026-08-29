@@ -3,6 +3,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -58,7 +59,10 @@ FOREX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY
 # ---------------------------------------------------------------------------
 WORDCLOUD_REFRESH_HOUR_ET = 6  # 6 AM Eastern
 WORDCLOUD_MAX_WORDS = 50
-WORDCLOUD_MIN_WORD_LENGTH = 3
+WORDCLOUD_MIN_WORD_LENGTH = 2  # Allows 'ai', 'ev', '5g', etc.
+
+# Tickers to pre-warm at server startup (so they're ready before first search)
+DEFAULT_WARMUP_TICKERS = ["GOOGL", "GOOG"]
 
 STOPWORDS = frozenset({
     "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her",
@@ -412,7 +416,6 @@ def get_cached_quote(symbol):
         except FinnhubError:
             pass
 
-        # yfinance zero-key fallback
         yf_data = fetch_yfinance_quote(symbol)
         if yf_data:
             with CACHE_LOCK:
@@ -460,7 +463,6 @@ def get_cached_profile(symbol):
         except FinnhubError:
             pass
 
-        # yfinance profile fallback
         try:
             import yfinance as yf
             t = yf.Ticker(symbol)
@@ -856,29 +858,29 @@ def _build_wordcloud_from_articles(articles, ticker):
 
 def get_cached_wordcloud(symbol):
     key = symbol.upper()
-    redis_key = f"wc:news:{key}"
+    # v2 prefix bypasses any corrupted 2026-dated keys from earlier deploys
+    redis_key = f"v2:wc:news:{key}"
     now = time.time()
     next_refresh = _next_wordcloud_refresh_epoch()
 
+    # 1. Redis check — ONLY accept if it actually contains words
     cached = _rget(redis_key)
-    # Only return cache if it contains actual words and hasn't expired
-    if cached and cached.get("words") and cached.get("expires_at", 0) > now:
-        with CACHE_LOCK:
-            WORDCLOUD_CACHE[key] = {"fetched_at": now, "data": cached}
-            _prune_cache(WORDCLOUD_CACHE)
-        return cached
+    if cached and isinstance(cached.get("words"), list) and len(cached["words"]) > 0:
+        if cached.get("expires_at", 0) > now:
+            with CACHE_LOCK:
+                WORDCLOUD_CACHE[key] = {"fetched_at": now, "data": cached}
+                _prune_cache(WORDCLOUD_CACHE)
+            return cached
 
+    # 2. In-memory check — ONLY accept if it actually contains words
     with CACHE_LOCK:
         entry = WORDCLOUD_CACHE.get(key)
-        if entry and entry["data"].get("words") and entry["data"].get("expires_at", 0) > now:
-            _touch_cache(WORDCLOUD_CACHE, key)
-            return entry["data"]
-        if key in IN_FLIGHT:
-            return entry["data"] if entry else {
-                "symbol": symbol, "words": [], "article_count": 0,
-                "generated_at": int(now), "expires_at": int(next_refresh),
-            }
+        if entry and isinstance(entry["data"].get("words"), list) and len(entry["data"]["words"]) > 0:
+            if entry["data"].get("expires_at", 0) > now:
+                _touch_cache(WORDCLOUD_CACHE, key)
+                return entry["data"]
 
+    # 3. Rebuild from live articles
     with InFlightGuard(key):
         articles = get_cached_news(symbol)
         words = _build_wordcloud_from_articles(articles, symbol)
@@ -892,14 +894,38 @@ def get_cached_wordcloud(symbol):
             "next_refresh_iso": datetime.fromtimestamp(next_refresh, ZoneInfo("America/New_York")).isoformat(),
         }
 
-        # If words were found, cache until 6 AM ET. If empty, cache for 60s to allow retries.
-        cache_ttl = _wordcloud_ttl_seconds() if words else 60
-        _rset(redis_key, payload, cache_ttl)
+        # Full TTL if words found; short TTL (30s) if empty to allow fast retry
+        ttl = _wordcloud_ttl_seconds() if len(words) > 0 else 30
+        _rset(redis_key, payload, ttl)
+
         with CACHE_LOCK:
             WORDCLOUD_CACHE[key] = {"fetched_at": now, "data": payload}
             _prune_cache(WORDCLOUD_CACHE)
 
         return payload
+
+
+# ---------------------------------------------------------------------------
+# Startup cache warm-up (pre-loads default tickers so frontend is instant)
+# ---------------------------------------------------------------------------
+def _warmup_cache():
+    """Background thread: pre-populate word clouds for default watchlist tickers."""
+    time.sleep(3)  # Give Flask a moment to fully initialize
+    logger.info("Starting word cloud warm-up for tickers: %s", DEFAULT_WARMUP_TICKERS)
+    for sym in DEFAULT_WARMUP_TICKERS:
+        try:
+            payload = get_cached_wordcloud(sym)
+            logger.info(
+                "Warm-up complete: %s (articles=%d, words=%d)",
+                sym, payload.get("article_count", 0), len(payload.get("words", [])),
+            )
+        except Exception as e:
+            logger.warning("Warm-up failed for %s: %s", sym, e)
+        time.sleep(1)  # brief pause between tickers to avoid rate limits
+
+
+# Trigger warm-up on import (runs once when Flask boots)
+threading.Thread(target=_warmup_cache, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -934,6 +960,7 @@ def health_check():
         "status": "up",
         "redis": bool(_redis_client),
         "market_open": is_market_open(),
+        "warmup_tickers": DEFAULT_WARMUP_TICKERS,
     })
 
 
@@ -1249,9 +1276,10 @@ def wordcloud(symbol):
             key = symbol.upper()
             with CACHE_LOCK:
                 WORDCLOUD_CACHE.pop(key, None)
+                NEWS_CACHE.pop(key, None)
             if _redis_client:
                 try:
-                    _redis_client.delete(f"wc:news:{key}")
+                    _redis_client.delete(f"v2:wc:news:{key}")
                 except Exception:
                     pass
 
