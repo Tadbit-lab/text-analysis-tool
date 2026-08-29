@@ -31,10 +31,10 @@ if REDIS_URL:
         _redis_client = None
 
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "d7p9q6pr01qlb0a998g0d7p9q6pr01qlb0a998gg")
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY", "UGVO3B6IXPO2ZQZK")
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
-TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY", "688fcc792bac433ebc3a9c17649a13d8")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")
+TWELVEDATA_API_KEY = os.getenv("TWELVEDATA_API_KEY")
 
 REQUEST_TIMEOUT_SECONDS = 10
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9./:-]{1,15}$")
