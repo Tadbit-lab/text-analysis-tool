@@ -612,7 +612,11 @@ def get_cached_news(symbol, _time_key=None):
 # ---------------------------------------------------------------------------
 # Finnhub Dynamic Word Cloud (Auto-refreshes daily at 6:00 AM ET)
 # ---------------------------------------------------------------------------
+from collections import Counter
+
+# Words to filter out so the word cloud shows meaningful market themes
 WORDCLOUD_STOPWORDS = {
+    # Standard grammatical stopwords
     "a", "about", "above", "after", "again", "against", "all", "am", "an", "and",
     "any", "are", "aren't", "as", "at", "be", "because", "been", "before", "being",
     "below", "between", "both", "but", "by", "can", "can't", "cannot", "could",
@@ -633,6 +637,7 @@ WORDCLOUD_STOPWORDS = {
     "while", "who", "who's", "whom", "why", "why's", "with", "won't", "would",
     "wouldn't", "you", "you'd", "you'll", "you're", "you've", "your", "yours",
     "yourself", "yourselves",
+    # News & financial noise / filler words
     "stock", "stocks", "shares", "share", "market", "markets", "price", "prices",
     "investor", "investors", "investing", "investment", "investments", "company",
     "companies", "corp", "inc", "ltd", "co", "report", "reports", "reported",
@@ -669,7 +674,8 @@ def generate_wordcloud(symbol=None, limit=80):
     """Builds a frequency-ranked word cloud from Finnhub news."""
     counter = Counter()
 
-    if symbol:
+    # Determine whether we are parsing a stock ticker or global market news
+    if symbol and symbol.upper() != "MARKET":
         articles = get_cached_news(symbol)
     else:
         articles = fetch_finnhub_general_news()
@@ -686,7 +692,8 @@ def generate_wordcloud(symbol=None, limit=80):
         summary = article.get("summary", "") or ""
         counter.update(_extract_word_tokens(f"{headline} {summary}"))
 
-    if symbol:
+    # Remove the ticker name itself from its own stock-specific word cloud
+    if symbol and symbol.upper() != "MARKET":
         counter.pop(symbol.lower(), None)
 
     top_pairs = counter.most_common(limit)
@@ -1161,21 +1168,23 @@ def news(symbol):
         return jsonify({"error": str(error)}), 400
 
 
-@app.get("/api/wordcloud")
-def get_wordcloud():
+@app.get("/api/wordcloud/<symbol>")
+def get_wordcloud(symbol):
     """
-    Dynamic Finnhub Word Cloud endpoint.
+    Dynamic Finnhub Word Cloud path parameter endpoint.
     Cache: Redis (primary) + In-Memory (fallback). Refreshes daily at 6:00 AM ET.
-    Query params:
-      - ?symbol=AAPL       (Optional: specific stock word cloud)
+    Path Params:
+      - symbol: Stock ticker (e.g., AAPL) or 'market' for broad market news cloud.
+    Query Params:
       - ?limit=100         (Optional: max words, default 80, max 200)
       - ?forceRefresh=true (Optional: bypass all caches)
     """
-    symbol_param = request.args.get("symbol")
-    symbol = None
-    if symbol_param:
+    normalized_symbol = symbol.strip().upper()
+    
+    # Allow 'MARKET' as a special keyword for broad general news, otherwise validate as a stock symbol
+    if normalized_symbol != "MARKET":
         try:
-            symbol = validate_symbol(symbol_param)
+            normalized_symbol = validate_symbol(normalized_symbol)
         except ValueError as err:
             return jsonify({"error": str(err)}), 400
 
@@ -1186,11 +1195,11 @@ def get_wordcloud():
         limit = 80
 
     force = request.args.get("forceRefresh") == "true"
-    cache_key = f"wc:{symbol or 'GLOBAL'}:{limit}"
+    cache_key = f"wc:{normalized_symbol}:{limit}"
     ttl = _seconds_until_next_6am_et()
 
     fallback = {
-        "symbol": symbol or "MARKET",
+        "symbol": normalized_symbol,
         "words": [],
         "meta": {"total_articles_scanned": 0, "unique_words_found": 0},
     }
@@ -1199,7 +1208,10 @@ def get_wordcloud():
         cache_key=cache_key,
         ttl_seconds=ttl,
         in_memory_store=WORDCLOUD_CACHE,
-        builder_fn=lambda: generate_wordcloud(symbol=symbol, limit=limit),
+        builder_fn=lambda: generate_wordcloud(
+            symbol=None if normalized_symbol == "MARKET" else normalized_symbol, 
+            limit=limit
+        ),
         fallback_data=fallback,
         force=force,
     )
