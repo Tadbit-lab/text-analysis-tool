@@ -9,6 +9,7 @@ from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Lock
+from urllib.parse import quote_plus
 from zoneinfo import ZoneInfo
 
 import redis
@@ -57,11 +58,10 @@ FOREX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY
 # ---------------------------------------------------------------------------
 # Word cloud configuration
 # ---------------------------------------------------------------------------
-WORDCLOUD_REFRESH_HOUR_ET = 6  # 6 AM Eastern
+WORDCLOUD_REFRESH_HOUR_ET = 6
 WORDCLOUD_MAX_WORDS = 50
-WORDCLOUD_MIN_WORD_LENGTH = 2  # Allows 'ai', 'ev', '5g', etc.
+WORDCLOUD_MIN_WORD_LENGTH = 2
 
-# Tickers to pre-warm at server startup (so they're ready before first search)
 DEFAULT_WARMUP_TICKERS = ["GOOGL", "GOOG"]
 
 STOPWORDS = frozenset({
@@ -739,26 +739,139 @@ def get_cached_watchlist(symbols):
 
 
 # ---------------------------------------------------------------------------
-# News (Finnhub + yfinance fallback)
+# News — hardened for Finnhub 503 + new yfinance shape
 # ---------------------------------------------------------------------------
+def _is_bad_news_url(url):
+    if not url or not isinstance(url, str):
+        return True
+    u = url.strip().lower()
+    if not u.startswith("http"):
+        return True
+    # Finnhub internal API pages 504 in browsers
+    if "finnhub.io/api/news" in u:
+        return True
+    if "finnhub.io/api/" in u:
+        return True
+    return False
+
+
+def _google_news_url(headline, symbol=""):
+    q = f"{symbol} {headline}".strip()
+    return f"https://news.google.com/search?q={quote_plus(q)}"
+
+
+def _extract_yfinance_url(item, content):
+    url = item.get("link") or item.get("url") or ""
+    if url:
+        return url
+    if not content:
+        return ""
+    for key in ("clickThroughUrl", "canonicalUrl"):
+        v = content.get(key)
+        if isinstance(v, dict) and v.get("url"):
+            return v.get("url")
+        if isinstance(v, str) and v.startswith("http"):
+            return v
+    return ""
+
+
+def _normalize_news_item(a, symbol=""):
+    if not isinstance(a, dict):
+        return None
+
+    headline = (a.get("headline") or a.get("title") or "").strip()
+    if not headline:
+        return None
+
+    url = (a.get("url") or a.get("link") or "").strip()
+    if _is_bad_news_url(url):
+        url = _google_news_url(headline, symbol)
+
+    ts = a.get("datetime") or a.get("providerPublishTime") or time.time()
+    try:
+        ts = int(ts)
+    except Exception:
+        ts = int(time.time())
+
+    return {
+        "headline": headline,
+        "summary": (a.get("summary") or a.get("description") or "")[:500],
+        "source": a.get("source") or a.get("publisher") or "News",
+        "url": url,
+        "datetime": ts,
+        "image": a.get("image") or "",
+    }
+
+
 def fetch_yfinance_news(symbol):
+    """Supports legacy yfinance news AND new nested `content` shape."""
     try:
         import yfinance as yf
+
         t = yf.Ticker(symbol)
         yf_news = t.news or []
         articles = []
+
         for item in yf_news:
-            title = item.get("title") or ""
-            summary = item.get("summary") or item.get("description") or ""
-            if title:
-                articles.append({
-                    "headline": title,
-                    "summary": summary,
-                    "source": item.get("publisher", "Yahoo Finance"),
-                    "url": item.get("link", ""),
-                    "datetime": item.get("providerPublishTime", int(time.time())),
-                    "image": (item.get("thumbnail", {}) or {}).get("resolutions", [{}])[0].get("url", "") if isinstance(item.get("thumbnail"), dict) else "",
-                })
+            if not isinstance(item, dict):
+                continue
+
+            content = item.get("content") if isinstance(item.get("content"), dict) else {}
+
+            title = (
+                item.get("title")
+                or content.get("title")
+                or content.get("headline")
+                or ""
+            ).strip()
+            if not title:
+                continue
+
+            summary = (
+                item.get("summary")
+                or item.get("description")
+                or content.get("summary")
+                or content.get("description")
+                or ""
+            )
+
+            publisher = item.get("publisher") or "Yahoo Finance"
+            provider = content.get("provider")
+            if isinstance(provider, dict):
+                publisher = provider.get("displayName") or publisher
+
+            url = _extract_yfinance_url(item, content)
+            if _is_bad_news_url(url):
+                url = _google_news_url(title, symbol)
+
+            ts = item.get("providerPublishTime") or content.get("pubDate") or time.time()
+            if isinstance(ts, str):
+                try:
+                    ts = int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+                except Exception:
+                    ts = int(time.time())
+            try:
+                ts = int(ts)
+            except Exception:
+                ts = int(time.time())
+
+            image = ""
+            thumb = item.get("thumbnail") or content.get("thumbnail")
+            if isinstance(thumb, dict):
+                resolutions = thumb.get("resolutions") or []
+                if resolutions and isinstance(resolutions[0], dict):
+                    image = resolutions[0].get("url") or ""
+                image = image or thumb.get("originalUrl") or thumb.get("url") or ""
+
+            articles.append({
+                "headline": title,
+                "summary": str(summary)[:500],
+                "source": publisher,
+                "url": url,
+                "datetime": ts,
+                "image": image,
+            })
+
         return articles
     except Exception as e:
         logger.warning("yfinance news fallback failed symbol=%s error=%s", symbol, e)
@@ -771,33 +884,67 @@ def get_cached_news(symbol):
 
     with CACHE_LOCK:
         entry = NEWS_CACHE.get(key)
-        if entry and now - entry["fetched_at"] < 300:
+        # Non-empty cache: 5 min
+        if entry and entry.get("data") and now - entry["fetched_at"] < 300:
             _touch_cache(NEWS_CACHE, key)
             return entry["data"]
+        # Empty cache: only 45s so Finnhub 503 can recover
+        if entry and not entry.get("data") and now - entry["fetched_at"] < 45:
+            return []
         if key in IN_FLIGHT:
             return entry["data"] if entry else []
 
     with InFlightGuard(key):
         today = datetime.now(timezone.utc).date()
-        articles = []
+        finnhub_articles = []
+        yf_articles = []
+
         try:
             data = finnhub_get(
                 "company-news",
-                {"symbol": symbol, "from": (today - timedelta(days=7)).isoformat(), "to": today.isoformat()},
+                {
+                    "symbol": symbol,
+                    "from": (today - timedelta(days=30)).isoformat(),
+                    "to": today.isoformat(),
+                },
             )
-            if isinstance(data, list) and len(data) > 0:
-                articles = data
-        except FinnhubError:
-            pass
+            if isinstance(data, list) and data:
+                finnhub_articles = data
+        except FinnhubError as err:
+            logger.warning("Finnhub news unavailable symbol=%s err=%s", symbol, err)
 
-        # Fallback to yfinance if Finnhub has 0 articles
-        if not articles:
-            articles = fetch_yfinance_news(symbol)
+        if len(finnhub_articles) < 3:
+            yf_articles = fetch_yfinance_news(symbol)
+
+        merged = []
+        seen = set()
+
+        # Prefer yfinance (real publisher URLs), then Finnhub
+        for raw in (yf_articles + finnhub_articles):
+            item = _normalize_news_item(raw, symbol)
+            if not item:
+                continue
+            h = item["headline"].lower()
+            if h in seen:
+                continue
+            seen.add(h)
+            merged.append(item)
+
+        merged.sort(key=lambda a: a.get("datetime", 0), reverse=True)
+
+        logger.info(
+            "news symbol=%s finnhub=%d yfinance=%d final=%d",
+            symbol,
+            len(finnhub_articles),
+            len(yf_articles),
+            len(merged),
+        )
 
         with CACHE_LOCK:
-            NEWS_CACHE[key] = {"fetched_at": now, "data": articles}
+            NEWS_CACHE[key] = {"fetched_at": now, "data": merged}
             _prune_cache(NEWS_CACHE)
-        return articles
+
+        return merged
 
 
 # ---------------------------------------------------------------------------
@@ -858,12 +1005,10 @@ def _build_wordcloud_from_articles(articles, ticker):
 
 def get_cached_wordcloud(symbol):
     key = symbol.upper()
-    # v2 prefix bypasses any corrupted 2026-dated keys from earlier deploys
     redis_key = f"v2:wc:news:{key}"
     now = time.time()
     next_refresh = _next_wordcloud_refresh_epoch()
 
-    # 1. Redis check — ONLY accept if it actually contains words
     cached = _rget(redis_key)
     if cached and isinstance(cached.get("words"), list) and len(cached["words"]) > 0:
         if cached.get("expires_at", 0) > now:
@@ -872,7 +1017,6 @@ def get_cached_wordcloud(symbol):
                 _prune_cache(WORDCLOUD_CACHE)
             return cached
 
-    # 2. In-memory check — ONLY accept if it actually contains words
     with CACHE_LOCK:
         entry = WORDCLOUD_CACHE.get(key)
         if entry and isinstance(entry["data"].get("words"), list) and len(entry["data"]["words"]) > 0:
@@ -880,7 +1024,6 @@ def get_cached_wordcloud(symbol):
                 _touch_cache(WORDCLOUD_CACHE, key)
                 return entry["data"]
 
-    # 3. Rebuild from live articles
     with InFlightGuard(key):
         articles = get_cached_news(symbol)
         words = _build_wordcloud_from_articles(articles, symbol)
@@ -894,7 +1037,6 @@ def get_cached_wordcloud(symbol):
             "next_refresh_iso": datetime.fromtimestamp(next_refresh, ZoneInfo("America/New_York")).isoformat(),
         }
 
-        # Full TTL if words found; short TTL (30s) if empty to allow fast retry
         ttl = _wordcloud_ttl_seconds() if len(words) > 0 else 30
         _rset(redis_key, payload, ttl)
 
@@ -906,11 +1048,10 @@ def get_cached_wordcloud(symbol):
 
 
 # ---------------------------------------------------------------------------
-# Startup cache warm-up (pre-loads default tickers so frontend is instant)
+# Startup warm-up
 # ---------------------------------------------------------------------------
 def _warmup_cache():
-    """Background thread: pre-populate word clouds for default watchlist tickers."""
-    time.sleep(3)  # Give Flask a moment to fully initialize
+    time.sleep(3)
     logger.info("Starting word cloud warm-up for tickers: %s", DEFAULT_WARMUP_TICKERS)
     for sym in DEFAULT_WARMUP_TICKERS:
         try:
@@ -921,10 +1062,9 @@ def _warmup_cache():
             )
         except Exception as e:
             logger.warning("Warm-up failed for %s: %s", sym, e)
-        time.sleep(1)  # brief pause between tickers to avoid rate limits
+        time.sleep(1)
 
 
-# Trigger warm-up on import (runs once when Flask boots)
 threading.Thread(target=_warmup_cache, daemon=True).start()
 
 
@@ -1241,21 +1381,26 @@ def news(symbol):
     try:
         symbol = validate_symbol(symbol)
         articles = get_cached_news(symbol)
+
+        # headline required; url normalized upstream
         valid_articles = [
             a for a in (articles if isinstance(articles, list) else [])
-            if a.get("headline") and a.get("url")
+            if a.get("headline")
         ]
         valid_articles.sort(key=lambda a: a.get("datetime", 0), reverse=True)
+
         return jsonify([
             {
                 "headline": a.get("headline", ""),
                 "source": a.get("source", ""),
-                "url": a.get("url", ""),
+                "url": a.get("url") or _google_news_url(a.get("headline", ""), symbol),
                 "image": a.get("image", ""),
                 "summary": a.get("summary", ""),
-                "published": datetime.fromtimestamp(a.get("datetime", 0), timezone.utc).strftime("%Y-%m-%d %H:%M"),
+                "published": datetime.fromtimestamp(
+                    a.get("datetime", int(time.time())), timezone.utc
+                ).strftime("%Y-%m-%d %H:%M"),
             }
-            for a in valid_articles[:5]
+            for a in valid_articles[:8]
         ])
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
