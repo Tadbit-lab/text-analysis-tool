@@ -5,8 +5,6 @@ import os
 import re
 import threading
 import time
-import uuid
-import hashlib
 from collections import Counter, OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -17,47 +15,22 @@ from zoneinfo import ZoneInfo
 import redis
 import requests
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request, make_response
+from flask import Flask, jsonify, request
 from flask_cors import CORS
-from flask_compress import Compress
-from flask_limiter import Limiter
-from flask_limiter.util import get_remote_address
-
-# ---------------------------------------------------------------------------
-# Lazy imports (yfinance & pandas)
-# ---------------------------------------------------------------------------
-try:
-    import yfinance as yf
-    import pandas as pd
-    YFINANCE_AVAILABLE = True
-except ImportError:
-    yf = None
-    pd = None
-    YFINANCE_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
-    format="%(asctime)s %(levelname)s %(name)s [%(request_id)s] %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
-
-_old_factory = logging.getLogRecordFactory()
-def _record_factory(*args, **kwargs):
-    record = _old_factory(*args, **kwargs)
-    try:
-        record.request_id = getattr(request, "request_id", "-")
-    except RuntimeError:
-        record.request_id = "-"
-    return record
-logging.setLogRecordFactory(_record_factory)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — API keys from environment
 # ---------------------------------------------------------------------------
 FINNHUB_BASE_URL = "https://finnhub.io/api/v1"
 TWELVEDATA_BASE_URL = "https://api.twelvedata.com"
@@ -73,8 +46,6 @@ if not TWELVEDATA_API_KEY:
     logger.warning("TWELVEDATA_API_KEY not set — using fallbacks for quotes/candles")
 if not ALPHAVANTAGE_API_KEY:
     logger.warning("ALPHAVANTAGE_API_KEY not set")
-if not YFINANCE_AVAILABLE:
-    logger.warning("yfinance not installed — fallbacks disabled")
 
 REQUEST_TIMEOUT_SECONDS = 10
 SYMBOL_PATTERN = re.compile(r"^[A-Z0-9./:-]{1,15}$")
@@ -90,7 +61,8 @@ FOREX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY
 WORDCLOUD_REFRESH_HOUR_ET = 6
 WORDCLOUD_MAX_WORDS = 50
 WORDCLOUD_MIN_WORD_LENGTH = 2
-DEFAULT_WARMUP_TICKERS = ["GOOGL", "GOOG", "AAPL", "MSFT"]
+
+DEFAULT_WARMUP_TICKERS = ["GOOGL", "GOOG"]
 
 STOPWORDS = frozenset({
     "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her",
@@ -120,7 +92,7 @@ STOPWORDS = frozenset({
 })
 
 # ---------------------------------------------------------------------------
-# Redis
+# Redis client
 # ---------------------------------------------------------------------------
 REDIS_URL = os.getenv("REDIS_URL")
 _redis_client = None
@@ -134,7 +106,7 @@ if REDIS_URL:
         _redis_client = None
 
 # ---------------------------------------------------------------------------
-# In-memory caches & thread control
+# In-memory caches (OrderedDict for LRU eviction)
 # ---------------------------------------------------------------------------
 QUOTE_CACHE = OrderedDict()
 PROFILE_CACHE = OrderedDict()
@@ -144,20 +116,12 @@ NEWS_CACHE = OrderedDict()
 TECHNICALS_CACHE = OrderedDict()
 WORDCLOUD_CACHE = OrderedDict()
 CACHE_LOCK = Lock()
-
-IN_FLIGHT_EVENTS = {}
-NEWS_FAIL_STREAK = {}
-FINNHUB_CIRCUIT = {"open_until": 0}
-WARMUP_STATE = {"complete": False, "started_at": None, "errors": []}
-
-_TECHNICALS_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="tech")
-_DASHBOARD_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="dash")
+IN_FLIGHT = {}
 
 # ---------------------------------------------------------------------------
 # Flask app
 # ---------------------------------------------------------------------------
 app = Flask(__name__, static_folder=None)
-Compress(app)
 CORS(
     app,
     resources={
@@ -175,13 +139,6 @@ CORS(
     },
 )
 
-limiter = Limiter(
-    app=app,
-    key_func=get_remote_address,
-    storage_uri=REDIS_URL or "memory://",
-    default_limits=["1000 per day", "200 per hour"],
-)
-
 
 class FinnhubError(Exception):
     def __init__(self, message, status_code=None):
@@ -190,49 +147,8 @@ class FinnhubError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Middleware & helpers
+# Utilities
 # ---------------------------------------------------------------------------
-@app.before_request
-def _add_request_id():
-    request.request_id = str(uuid.uuid4())[:8]
-
-
-@app.after_request
-def _log_request(response):
-    logger.info("method=%s path=%s status=%s", request.method, request.path, response.status_code)
-    return response
-
-
-def cached_json(payload, max_age=60):
-    body = json.dumps(payload)
-    etag = hashlib.md5(body.encode()).hexdigest()
-    response = make_response(body)
-    response.headers["Content-Type"] = "application/json"
-    response.headers["Cache-Control"] = f"public, max-age={max_age}"
-    response.headers["ETag"] = etag
-    return response
-
-
-def _flight_key(prefix, *parts):
-    return f"{prefix}:" + ":".join(str(p) for p in parts)
-
-
-def wait_or_claim(key):
-    """Return (should_fetch, event). If should_fetch=False, wait for event."""
-    with CACHE_LOCK:
-        if key in IN_FLIGHT_EVENTS:
-            return False, IN_FLIGHT_EVENTS[key]
-        event = threading.Event()
-        IN_FLIGHT_EVENTS[key] = event
-        return True, event
-
-
-def release_key(key, event):
-    with CACHE_LOCK:
-        IN_FLIGHT_EVENTS.pop(key, None)
-    event.set()
-
-
 def validate_symbol(symbol):
     normalized = symbol.strip().upper()
     if not SYMBOL_PATTERN.fullmatch(normalized):
@@ -254,9 +170,9 @@ def is_market_open():
     now_et = datetime.now(ZoneInfo("America/New_York"))
     if now_et.weekday() >= 5:
         return False
-    open_t = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    close_t = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    return open_t <= now_et <= close_t
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now_et <= market_close
 
 
 def _prune_cache(cache):
@@ -347,13 +263,25 @@ def _rset(key, value, ttl):
         logger.warning("Redis set failed key=%s err=%s", key, err)
 
 
+class InFlightGuard:
+    def __init__(self, key):
+        self.key = key
+
+    def __enter__(self):
+        with CACHE_LOCK:
+            IN_FLIGHT[self.key] = time.time()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        with CACHE_LOCK:
+            IN_FLIGHT.pop(self.key, None)
+        return False
+
+
 # ---------------------------------------------------------------------------
 # External API callers
 # ---------------------------------------------------------------------------
 def finnhub_get(endpoint, params):
-    if time.time() < FINNHUB_CIRCUIT["open_until"]:
-        raise FinnhubError("Finnhub circuit open", 429)
-
     if not FINNHUB_API_KEY:
         raise FinnhubError("Finnhub API key is not configured")
 
@@ -363,27 +291,16 @@ def finnhub_get(endpoint, params):
     try:
         response = requests.get(url, params=request_params, timeout=REQUEST_TIMEOUT_SECONDS)
         duration_ms = (time.perf_counter() - started_at) * 1000
-        logger.info(
-            "Finnhub API endpoint=%s status=%s duration_ms=%.2f",
-            endpoint, response.status_code, duration_ms,
-        )
-
-        if response.status_code in (429, 503):
-            FINNHUB_CIRCUIT["open_until"] = time.time() + 60
-            logger.warning("Finnhub circuit opened for 60s (status=%s)", response.status_code)
-
+        logger.info("Finnhub API call endpoint=%s status=%s duration_ms=%.2f", endpoint, response.status_code, duration_ms)
         response.raise_for_status()
         return response.json()
     except requests.RequestException as error:
         duration_ms = (time.perf_counter() - started_at) * 1000
         status_code = getattr(error.response, "status_code", None)
-        logger.error(
-            "Finnhub failure endpoint=%s status=%s duration_ms=%.2f err_type=%s",
-            endpoint, status_code, duration_ms, type(error).__name__,
-        )
+        logger.error("Finnhub API failure endpoint=%s status=%s duration_ms=%.2f error_type=%s", endpoint, status_code, duration_ms, type(error).__name__)
         raise FinnhubError("Finnhub request failed", status_code) from error
     except ValueError as error:
-        logger.error("Finnhub invalid JSON endpoint=%s err=%s", endpoint, error)
+        logger.error("Finnhub returned invalid JSON endpoint=%s error=%s", endpoint, error)
         raise FinnhubError("Finnhub returned invalid data") from error
 
 
@@ -397,18 +314,15 @@ def twelvedata_get(endpoint, params=None):
     try:
         response = requests.get(url, params=request_params, timeout=REQUEST_TIMEOUT_SECONDS)
         duration_ms = (time.perf_counter() - started_at) * 1000
-        logger.info(
-            "TwelveData API endpoint=%s status=%s duration_ms=%.2f",
-            endpoint, response.status_code, duration_ms,
-        )
+        logger.info("TwelveData API call endpoint=%s status=%s duration_ms=%.2f", endpoint, response.status_code, duration_ms)
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict) and data.get("status") == "error":
-            logger.warning("TwelveData error endpoint=%s message=%s", endpoint, data.get("message"))
+            logger.warning("TwelveData returned error endpoint=%s message=%s", endpoint, data.get("message"))
             return None
         return data
     except Exception as error:
-        logger.warning("TwelveData failed endpoint=%s err=%s", endpoint, error)
+        logger.warning("TwelveData request failed endpoint=%s error=%s", endpoint, error)
         return None
 
 
@@ -441,9 +355,8 @@ def fetch_twelvedata_quote(symbol):
 
 
 def fetch_yfinance_quote(symbol):
-    if not YFINANCE_AVAILABLE:
-        return None
     try:
+        import yfinance as yf
         t = yf.Ticker(symbol)
         info = t.fast_info
         last_price = _sf(info.last_price)
@@ -475,7 +388,6 @@ def fetch_yfinance_quote(symbol):
 
 def get_cached_quote(symbol):
     key = symbol.upper()
-    flight_key = _flight_key("quote", key)
     now = time.time()
 
     with CACHE_LOCK:
@@ -483,15 +395,10 @@ def get_cached_quote(symbol):
         if entry and now - entry["fetched_at"] < _quote_ttl_seconds():
             _touch_cache(QUOTE_CACHE, key)
             return entry["data"]
-
-    should_fetch, event = wait_or_claim(flight_key)
-    if not should_fetch:
-        event.wait(timeout=REQUEST_TIMEOUT_SECONDS + 2)
-        with CACHE_LOCK:
-            entry = QUOTE_CACHE.get(key)
+        if key in IN_FLIGHT:
             return entry["data"] if entry else _get_empty_quote_payload()
 
-    try:
+    with InFlightGuard(key):
         td_data = fetch_twelvedata_quote(symbol)
         if td_data:
             with CACHE_LOCK:
@@ -521,8 +428,6 @@ def get_cached_quote(symbol):
             QUOTE_CACHE[key] = {"fetched_at": now, "data": fallback}
             _prune_cache(QUOTE_CACHE)
         return fallback
-    finally:
-        release_key(flight_key, event)
 
 
 # ---------------------------------------------------------------------------
@@ -530,7 +435,6 @@ def get_cached_quote(symbol):
 # ---------------------------------------------------------------------------
 def get_cached_profile(symbol):
     key = symbol.upper()
-    flight_key = _flight_key("profile", key)
     now = time.time()
 
     with CACHE_LOCK:
@@ -538,15 +442,10 @@ def get_cached_profile(symbol):
         if entry and now - entry["fetched_at"] < 3600:
             _touch_cache(PROFILE_CACHE, key)
             return entry["data"]
-
-    should_fetch, event = wait_or_claim(flight_key)
-    if not should_fetch:
-        event.wait(timeout=REQUEST_TIMEOUT_SECONDS + 2)
-        with CACHE_LOCK:
-            entry = PROFILE_CACHE.get(key)
+        if key in IN_FLIGHT:
             return entry["data"] if entry else _get_empty_profile_payload()
 
-    try:
+    with InFlightGuard(key):
         try:
             data = finnhub_get("stock/profile2", {"symbol": symbol})
             if data and data.get("name"):
@@ -564,31 +463,27 @@ def get_cached_profile(symbol):
         except FinnhubError:
             pass
 
-        if YFINANCE_AVAILABLE:
-            try:
-                t = yf.Ticker(symbol)
-                info = t.info or {}
-                payload = {
-                    "name": info.get("longName") or info.get("shortName") or symbol,
-                    "logo": "",
-                    "finnhubIndustry": info.get("industry") or info.get("sector") or "",
-                    "marketCapitalization": (_sf(info.get("marketCap")) or 0.0) / 1e6,
-                    "country": info.get("country") or "",
-                }
-                with CACHE_LOCK:
-                    PROFILE_CACHE[key] = {"fetched_at": now, "data": payload}
-                    _prune_cache(PROFILE_CACHE)
-                return payload
-            except Exception:
-                pass
-
-        fallback = _get_empty_profile_payload()
-        with CACHE_LOCK:
-            PROFILE_CACHE[key] = {"fetched_at": now, "data": fallback}
-            _prune_cache(PROFILE_CACHE)
-        return fallback
-    finally:
-        release_key(flight_key, event)
+        try:
+            import yfinance as yf
+            t = yf.Ticker(symbol)
+            info = t.info or {}
+            payload = {
+                "name": info.get("longName") or info.get("shortName") or symbol,
+                "logo": "",
+                "finnhubIndustry": info.get("industry") or info.get("sector") or "",
+                "marketCapitalization": (_sf(info.get("marketCap")) or 0.0) / 1e6,
+                "country": info.get("country") or "",
+            }
+            with CACHE_LOCK:
+                PROFILE_CACHE[key] = {"fetched_at": now, "data": payload}
+                _prune_cache(PROFILE_CACHE)
+            return payload
+        except Exception:
+            fallback = _get_empty_profile_payload()
+            with CACHE_LOCK:
+                PROFILE_CACHE[key] = {"fetched_at": now, "data": fallback}
+                _prune_cache(PROFILE_CACHE)
+            return fallback
 
 
 # ---------------------------------------------------------------------------
@@ -606,6 +501,7 @@ TWELVEDATA_INTERVALS = {
 def fetch_alpha_vantage_candles(symbol, resolution, days):
     if not ALPHAVANTAGE_API_KEY:
         return None
+
     func = ALPHAVANTAGE_FUNCTIONS.get(resolution.upper())
     if not func:
         return None
@@ -627,6 +523,7 @@ def fetch_alpha_vantage_candles(symbol, resolution, days):
         if "Time Series" in k and isinstance(v, dict):
             series = v
             break
+
     if not series:
         return None
 
@@ -662,9 +559,7 @@ def fetch_twelvedata_candles(symbol, resolution, days):
     outputsize = max(size, 30)
 
     query_symbol = format_forex_symbol(symbol) if is_forex_pair(symbol) else symbol
-    data = twelvedata_get("time_series", {
-        "symbol": query_symbol, "interval": interval, "outputsize": outputsize,
-    })
+    data = twelvedata_get("time_series", {"symbol": query_symbol, "interval": interval, "outputsize": outputsize})
 
     if not data or not isinstance(data, dict) or not data.get("values"):
         return None
@@ -674,9 +569,7 @@ def fetch_twelvedata_candles(symbol, resolution, days):
     for entry in raw_vals[-size:]:
         try:
             dt_str = entry["datetime"]
-            dt = datetime.strptime(
-                dt_str, "%Y-%m-%d %H:%M:%S" if " " in dt_str else "%Y-%m-%d"
-            ).replace(tzinfo=timezone.utc)
+            dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S" if " " in dt_str else "%Y-%m-%d").replace(tzinfo=timezone.utc)
             timestamps.append(int(dt.timestamp()))
             opens.append(_sf(entry.get("open")) or 0.0)
             highs.append(_sf(entry.get("high")) or 0.0)
@@ -693,9 +586,8 @@ def fetch_twelvedata_candles(symbol, resolution, days):
 
 
 def fetch_yfinance_candles(symbol, resolution, days):
-    if not YFINANCE_AVAILABLE:
-        return None
     try:
+        import yfinance as yf
         interval_map = {
             "1": "1m", "5": "5m", "15": "15m", "30": "30m", "60": "1h",
             "D": "1d", "1D": "1d", "W": "1wk", "1W": "1wk", "M": "1mo", "1M": "1mo",
@@ -733,92 +625,58 @@ def fetch_yfinance_candles(symbol, resolution, days):
             "volume": [int(x) for x in df["Volume"]],
         }
     except Exception as e:
-        logger.warning("yfinance candle fallback failed symbol=%s err=%s", symbol, e)
+        logger.warning("yfinance candle fallback failed symbol=%s error=%s", symbol, e)
         return None
 
 
-def get_cached_candles(symbol, resolution, days, force_refresh=False):
+def get_cached_candles(symbol, resolution, days):
     cache_key = (symbol.upper(), resolution.upper(), int(days))
-    flight_key = _flight_key("candle", symbol, resolution, days)
-    redis_key = f"v2:candles:{symbol.upper()}:{resolution.upper()}:{int(days)}"
     now = time.time()
     ttl_seconds = _candle_ttl_seconds(days, resolution)
 
-    if not force_refresh:
-        with CACHE_LOCK:
-            entry = CANDLE_CACHE.get(cache_key)
-            if entry and not entry.get("empty") and entry["data"].get("timestamps") \
-                    and now - entry["fetched_at"] < ttl_seconds:
-                _touch_cache(CANDLE_CACHE, cache_key)
-                return entry["data"]
-            if entry and entry.get("empty") and now - entry["fetched_at"] < 30:
-                return entry["data"]
+    with CACHE_LOCK:
+        entry = CANDLE_CACHE.get(cache_key)
+        if entry and entry["data"].get("timestamps") and now - entry["fetched_at"] < ttl_seconds:
+            _touch_cache(CANDLE_CACHE, cache_key)
+            return entry["data"]
+        if cache_key in IN_FLIGHT:
+            return entry["data"] if entry and entry["data"].get("timestamps") else _get_empty_candle_payload()
 
-        redis_data = _rget(redis_key)
-        if redis_data and redis_data.get("timestamps"):
-            with CACHE_LOCK:
-                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": redis_data, "empty": False}
-                _prune_cache(CANDLE_CACHE)
-            return redis_data
-
-    should_fetch, event = wait_or_claim(flight_key)
-    if not should_fetch:
-        event.wait(timeout=REQUEST_TIMEOUT_SECONDS + 2)
-        with CACHE_LOCK:
-            entry = CANDLE_CACHE.get(cache_key)
-            return entry["data"] if entry else _get_empty_candle_payload()
-
-    try:
+    with InFlightGuard(cache_key):
         td_data = fetch_twelvedata_candles(symbol, resolution, days)
         if td_data and td_data.get("timestamps"):
-            _rset(redis_key, td_data, ttl_seconds)
             with CACHE_LOCK:
-                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": td_data, "empty": False}
+                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": td_data}
                 _prune_cache(CANDLE_CACHE)
             return td_data
 
         av_data = fetch_alpha_vantage_candles(symbol, resolution, days)
         if av_data and av_data.get("timestamps"):
-            _rset(redis_key, av_data, ttl_seconds)
             with CACHE_LOCK:
-                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": av_data, "empty": False}
+                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": av_data}
                 _prune_cache(CANDLE_CACHE)
             return av_data
 
         yf_data = fetch_yfinance_candles(symbol, resolution, days)
         if yf_data and yf_data.get("timestamps"):
-            _rset(redis_key, yf_data, ttl_seconds)
             with CACHE_LOCK:
-                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": yf_data, "empty": False}
+                CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": yf_data}
                 _prune_cache(CANDLE_CACHE)
             return yf_data
 
         fallback = _get_empty_candle_payload()
         with CACHE_LOCK:
-            CANDLE_CACHE[cache_key] = {"fetched_at": now, "data": fallback, "empty": True}
+            CANDLE_CACHE[cache_key] = {"fetched_at": now - 3595, "data": fallback}
             _prune_cache(CANDLE_CACHE)
         return fallback
-    finally:
-        release_key(flight_key, event)
 
 
 # ---------------------------------------------------------------------------
 # Watchlist
 # ---------------------------------------------------------------------------
-def _extract_td_quote(batch, sym):
-    if not isinstance(batch, dict):
-        return None
-    if sym in batch and isinstance(batch[sym], dict):
-        return batch[sym]
-    if batch.get("symbol", "").upper() == sym.upper():
-        return batch
-    return None
-
-
 def get_cached_watchlist(symbols):
     normalized_symbols = sorted({validate_symbol(s) for s in symbols})
     cache_key = tuple(normalized_symbols)
-    flight_key = _flight_key("watchlist", ",".join(normalized_symbols))
     now = time.time()
 
     with CACHE_LOCK:
@@ -826,23 +684,17 @@ def get_cached_watchlist(symbols):
         if entry and now - entry["fetched_at"] < WATCHLIST_TTL_SECONDS:
             _touch_cache(WATCHLIST_CACHE, cache_key)
             return entry["data"]
-
-    should_fetch, event = wait_or_claim(flight_key)
-    if not should_fetch:
-        event.wait(timeout=REQUEST_TIMEOUT_SECONDS + 2)
-        with CACHE_LOCK:
-            entry = WATCHLIST_CACHE.get(cache_key)
+        if cache_key in IN_FLIGHT:
             return entry["data"] if entry else []
 
-    try:
-        payload = []
-        # TwelveData free tier: chunk in groups of 8
-        for i in range(0, len(normalized_symbols), 8):
-            chunk = normalized_symbols[i:i + 8]
-            td_batch = twelvedata_get("quote", {"symbol": ",".join(chunk)})
+    with InFlightGuard(cache_key):
+        batch_str = ",".join(normalized_symbols)
+        td_batch = twelvedata_get("quote", {"symbol": batch_str})
 
-            for sym in chunk:
-                item = _extract_td_quote(td_batch, sym) if td_batch else None
+        payload = []
+        if td_batch and isinstance(td_batch, dict):
+            for sym in normalized_symbols:
+                item = td_batch.get(sym) if isinstance(td_batch.get(sym), dict) else (td_batch if td_batch.get("symbol") == sym else None)
                 if item and "close" in item:
                     payload.append({
                         "symbol": sym,
@@ -866,17 +718,28 @@ def get_cached_watchlist(symbols):
                         "open": _sf(q.get("o")) or 0.0,
                         "previous_close": _sf(q.get("pc")) or 0.0,
                     })
+        else:
+            for symbol in normalized_symbols:
+                quote = get_cached_quote(symbol)
+                payload.append({
+                    "symbol": symbol,
+                    "current_price": _sf(quote.get("c")) or 0.0,
+                    "change": _sf(quote.get("d")) or 0.0,
+                    "percent_change": _sf(quote.get("dp")) or 0.0,
+                    "high": _sf(quote.get("h")) or 0.0,
+                    "low": _sf(quote.get("l")) or 0.0,
+                    "open": _sf(quote.get("o")) or 0.0,
+                    "previous_close": _sf(quote.get("pc")) or 0.0,
+                })
 
         with CACHE_LOCK:
             WATCHLIST_CACHE[cache_key] = {"fetched_at": now, "data": payload}
             _prune_cache(WATCHLIST_CACHE)
         return payload
-    finally:
-        release_key(flight_key, event)
 
 
 # ---------------------------------------------------------------------------
-# News helpers
+# News — hardened for Finnhub 503 + new yfinance shape
 # ---------------------------------------------------------------------------
 def _is_bad_news_url(url):
     if not url or not isinstance(url, str):
@@ -884,6 +747,7 @@ def _is_bad_news_url(url):
     u = url.strip().lower()
     if not u.startswith("http"):
         return True
+    # Finnhub internal API pages 504 in browsers
     if "finnhub.io/api/news" in u:
         return True
     if "finnhub.io/api/" in u:
@@ -941,9 +805,9 @@ def _normalize_news_item(a, symbol=""):
 
 def fetch_yfinance_news(symbol):
     """Supports legacy yfinance news AND new nested `content` shape."""
-    if not YFINANCE_AVAILABLE:
-        return []
     try:
+        import yfinance as yf
+
         t = yf.Ticker(symbol)
         yf_news = t.news or []
         articles = []
@@ -1010,34 +874,27 @@ def fetch_yfinance_news(symbol):
 
         return articles
     except Exception as e:
-        logger.warning("yfinance news fallback failed symbol=%s err=%s", symbol, e)
+        logger.warning("yfinance news fallback failed symbol=%s error=%s", symbol, e)
         return []
 
 
 def get_cached_news(symbol):
     key = symbol.upper()
-    flight_key = _flight_key("news", key)
     now = time.time()
 
     with CACHE_LOCK:
         entry = NEWS_CACHE.get(key)
+        # Non-empty cache: 5 min
         if entry and entry.get("data") and now - entry["fetched_at"] < 300:
             _touch_cache(NEWS_CACHE, key)
             return entry["data"]
-
-        fails = NEWS_FAIL_STREAK.get(key, 0)
-        empty_ttl = min(45 * (2 ** fails), 600)
-        if entry and not entry.get("data") and now - entry["fetched_at"] < empty_ttl:
+        # Empty cache: only 45s so Finnhub 503 can recover
+        if entry and not entry.get("data") and now - entry["fetched_at"] < 45:
             return []
-
-    should_fetch, event = wait_or_claim(flight_key)
-    if not should_fetch:
-        event.wait(timeout=REQUEST_TIMEOUT_SECONDS + 2)
-        with CACHE_LOCK:
-            entry = NEWS_CACHE.get(key)
+        if key in IN_FLIGHT:
             return entry["data"] if entry else []
 
-    try:
+    with InFlightGuard(key):
         today = datetime.now(timezone.utc).date()
         finnhub_articles = []
         yf_articles = []
@@ -1061,6 +918,8 @@ def get_cached_news(symbol):
 
         merged = []
         seen = set()
+
+        # Prefer yfinance (real publisher URLs), then Finnhub
         for raw in (yf_articles + finnhub_articles):
             item = _normalize_news_item(raw, symbol)
             if not item:
@@ -1075,20 +934,17 @@ def get_cached_news(symbol):
 
         logger.info(
             "news symbol=%s finnhub=%d yfinance=%d final=%d",
-            symbol, len(finnhub_articles), len(yf_articles), len(merged),
+            symbol,
+            len(finnhub_articles),
+            len(yf_articles),
+            len(merged),
         )
 
         with CACHE_LOCK:
-            if not merged:
-                NEWS_FAIL_STREAK[key] = NEWS_FAIL_STREAK.get(key, 0) + 1
-            else:
-                NEWS_FAIL_STREAK.pop(key, None)
             NEWS_CACHE[key] = {"fetched_at": now, "data": merged}
             _prune_cache(NEWS_CACHE)
 
         return merged
-    finally:
-        release_key(flight_key, event)
 
 
 # ---------------------------------------------------------------------------
@@ -1096,9 +952,7 @@ def get_cached_news(symbol):
 # ---------------------------------------------------------------------------
 def _next_wordcloud_refresh_epoch():
     now_et = datetime.now(ZoneInfo("America/New_York"))
-    refresh_today = now_et.replace(
-        hour=WORDCLOUD_REFRESH_HOUR_ET, minute=0, second=0, microsecond=0
-    )
+    refresh_today = now_et.replace(hour=WORDCLOUD_REFRESH_HOUR_ET, minute=0, second=0, microsecond=0)
     next_refresh = refresh_today if now_et < refresh_today else refresh_today + timedelta(days=1)
     return next_refresh.timestamp()
 
@@ -1140,7 +994,11 @@ def _build_wordcloud_from_articles(articles, ticker):
     max_count = top[0][1] if top else 1
 
     return [
-        {"text": word, "value": count, "weight": round(count / max_count, 3)}
+        {
+            "text": word,
+            "value": count,
+            "weight": round(count / max_count, 3),
+        }
         for word, count in top
     ]
 
@@ -1166,16 +1024,7 @@ def get_cached_wordcloud(symbol):
                 _touch_cache(WORDCLOUD_CACHE, key)
                 return entry["data"]
 
-    flight_key = _flight_key("wordcloud", key)
-    should_fetch, event = wait_or_claim(flight_key)
-    if not should_fetch:
-        event.wait(timeout=REQUEST_TIMEOUT_SECONDS + 2)
-        with CACHE_LOCK:
-            entry = WORDCLOUD_CACHE.get(key)
-            if entry:
-                return entry["data"]
-
-    try:
+    with InFlightGuard(key):
         articles = get_cached_news(symbol)
         words = _build_wordcloud_from_articles(articles, symbol)
 
@@ -1185,9 +1034,7 @@ def get_cached_wordcloud(symbol):
             "article_count": len(articles) if isinstance(articles, list) else 0,
             "generated_at": int(now),
             "expires_at": int(next_refresh),
-            "next_refresh_iso": datetime.fromtimestamp(
-                next_refresh, ZoneInfo("America/New_York")
-            ).isoformat(),
+            "next_refresh_iso": datetime.fromtimestamp(next_refresh, ZoneInfo("America/New_York")).isoformat(),
         }
 
         ttl = _wordcloud_ttl_seconds() if len(words) > 0 else 30
@@ -1198,228 +1045,24 @@ def get_cached_wordcloud(symbol):
             _prune_cache(WORDCLOUD_CACHE)
 
         return payload
-    finally:
-        release_key(flight_key, event)
 
 
 # ---------------------------------------------------------------------------
-# Fundamentals / Income / Valuation
-# ---------------------------------------------------------------------------
-_TTL_1DAY = 86400
-_EMPTY_FUNDAMENTALS = {
-    "symbol": "", "name": "", "sector": "", "industry": "",
-    "market_cap": None, "pe_ratio": None, "eps": None, "revenue": None,
-    "profit_margin": None, "shares_outstanding": None, "country": "", "description": "",
-}
-_EMPTY_INCOME = {
-    "symbol": "", "periods": [], "total_revenue": [], "gross_profit": [],
-    "operating_income": [], "net_income": [], "ebitda": [], "synthetic": False,
-}
-_EMPTY_VALUATION = {
-    "symbol": "", "pe_ratio": None, "pb_ratio": None, "ps_ratio": None,
-    "ev_ebitda": None, "peg_ratio": None, "enterprise_value": None, "market_cap": None,
-}
-
-
-def _get_finnhub_metrics(symbol):
-    try:
-        data = finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
-        return data.get("metric", {}) if isinstance(data, dict) else {}
-    except Exception as err:
-        logger.warning("Finnhub metrics fetch failed symbol=%s err=%s", symbol, err)
-        return {}
-
-
-def _fundamentals_payload(symbol):
-    profile = get_cached_profile(symbol)
-    metrics = _get_finnhub_metrics(symbol)
-
-    description = ""
-    if YFINANCE_AVAILABLE:
-        try:
-            t = yf.Ticker(symbol)
-            info = t.info or {}
-            description = str(info.get("longBusinessSummary") or "")[:600]
-        except Exception:
-            pass
-
-    if not description:
-        description = (
-            f"{profile.get('name', symbol)} operates in the "
-            f"{profile.get('finnhubIndustry', 'global market')} sector."
-        )
-
-    market_cap_raw = _sf(metrics.get("marketCapitalization")) or _sf(profile.get("marketCapitalization"))
-    market_cap = market_cap_raw * 1e6 if market_cap_raw else None
-
-    rev_per_share = _sf(metrics.get("revenuePerShareTTM"))
-    shares = _sf(metrics.get("sharesOutstanding"))
-    total_rev = None
-    if rev_per_share and shares:
-        total_rev = rev_per_share * shares * 1e6
-    elif market_cap and _sf(metrics.get("psTTM")):
-        total_rev = market_cap / _sf(metrics.get("psTTM"))
-
-    margin = _sf(metrics.get("netMarginTTM")) or _sf(metrics.get("netMarginAnnual"))
-    if margin:
-        margin = margin / 100.0
-
-    return {
-        "symbol": symbol,
-        "name": profile.get("name") or symbol,
-        "sector": profile.get("finnhubIndustry") or "",
-        "industry": profile.get("finnhubIndustry") or "",
-        "market_cap": market_cap,
-        "pe_ratio": _sf(metrics.get("peTTM")) or _sf(metrics.get("peNormalizedAnnual")) or _sf(metrics.get("peAnnual")),
-        "eps": _sf(metrics.get("epsTTM")) or _sf(metrics.get("epsAnnual")),
-        "revenue": total_rev,
-        "profit_margin": margin,
-        "shares_outstanding": shares,
-        "country": profile.get("country") or "",
-        "description": description,
-    }
-
-
-def _income_payload(symbol):
-    if YFINANCE_AVAILABLE:
-        try:
-            t = yf.Ticker(symbol)
-            df = t.financials
-            if df is not None and not df.empty:
-                df = df.T.sort_index()
-
-                def col(df_, *names):
-                    for n in names:
-                        if n in df_.columns:
-                            return [None if pd.isna(v) else round(float(v), 2) for v in df_[n]]
-                    return []
-
-                periods = [str(idx)[:10] for idx in df.index]
-                return {
-                    "symbol": symbol,
-                    "periods": periods,
-                    "total_revenue": col(df, "Total Revenue"),
-                    "gross_profit": col(df, "Gross Profit"),
-                    "operating_income": col(df, "Operating Income", "EBIT"),
-                    "net_income": col(df, "Net Income"),
-                    "ebitda": col(df, "EBITDA", "Normalized EBITDA"),
-                    "synthetic": False,
-                }
-        except Exception as err:
-            logger.warning("yfinance income failed symbol=%s err=%s", symbol, err)
-
-    profile = get_cached_profile(symbol)
-    metrics = _get_finnhub_metrics(symbol)
-    market_cap_raw = _sf(metrics.get("marketCapitalization")) or _sf(profile.get("marketCapitalization")) or 1e5
-    market_cap = market_cap_raw * 1e6
-    ps = _sf(metrics.get("psTTM")) or 5.0
-    base_rev = market_cap / ps if ps > 0 else 1e10
-    growth = (_sf(metrics.get("revenueGrowthTTMYoy")) or 10.0) / 100.0
-    margin = (_sf(metrics.get("netMarginTTM")) or 15.0) / 100.0
-
-    revs = [round(base_rev / ((1 + growth) ** (3 - i)), 2) for i in range(4)]
-    nets = [round(r * margin, 2) for r in revs]
-    gross = [round(r * 0.45, 2) for r in revs]
-    op = [round(r * 0.25, 2) for r in revs]
-    ebitda = [round(r * 0.30, 2) for r in revs]
-
-    return {
-        "symbol": symbol,
-        "periods": ["2021", "2022", "2023", "2024"],
-        "total_revenue": revs,
-        "gross_profit": gross,
-        "operating_income": op,
-        "net_income": nets,
-        "ebitda": ebitda,
-        "synthetic": True,
-        "_note": "Synthetic estimate — real financials unavailable",
-    }
-
-
-def _valuation_payload(symbol):
-    profile = get_cached_profile(symbol)
-    metrics = _get_finnhub_metrics(symbol)
-
-    market_cap_raw = _sf(metrics.get("marketCapitalization")) or _sf(profile.get("marketCapitalization"))
-    market_cap = market_cap_raw * 1e6 if market_cap_raw else None
-
-    pe = _sf(metrics.get("peTTM")) or _sf(metrics.get("peNormalizedAnnual")) or _sf(metrics.get("peAnnual"))
-    pb = _sf(metrics.get("pbQuarterly")) or _sf(metrics.get("pbAnnual"))
-    ps = _sf(metrics.get("psTTM")) or _sf(metrics.get("psAnnual"))
-    peg = _sf(metrics.get("pegAnnual")) or _sf(metrics.get("pegTTM"))
-    ev_ebitda = _sf(metrics.get("evToEbitdaAnnual")) or _sf(metrics.get("evToEbitdaTTM"))
-
-    ev_raw = _sf(metrics.get("enterpriseValue"))
-    ev = ev_raw * 1e6 if ev_raw else None
-
-    if (not ev_ebitda or not ev) and YFINANCE_AVAILABLE:
-        try:
-            t = yf.Ticker(symbol)
-            info = t.info or {}
-            if not ev_ebitda:
-                ev_ebitda = _sf(info.get("enterpriseToEbitda"))
-            if not ev:
-                ev = _sf(info.get("enterpriseValue"))
-        except Exception:
-            pass
-
-    return {
-        "symbol": symbol,
-        "pe_ratio": pe,
-        "pb_ratio": pb,
-        "ps_ratio": ps,
-        "ev_ebitda": ev_ebitda,
-        "peg_ratio": peg,
-        "enterprise_value": ev or market_cap,
-        "market_cap": market_cap,
-    }
-
-
-def _fundamentals_endpoint(symbol, cache_key_tpl, builder_fn, empty_template, ttl):
-    try:
-        symbol = validate_symbol(symbol)
-    except ValueError as err:
-        return jsonify({"error": str(err)}), 400
-
-    cache_key = cache_key_tpl.format(symbol=symbol)
-    cached = _rget(cache_key)
-    if cached:
-        return cached_json(cached, max_age=ttl)
-
-    try:
-        payload = builder_fn(symbol)
-        _rset(cache_key, payload, ttl)
-        return cached_json(payload, max_age=ttl)
-    except Exception as err:
-        logger.warning("Fundamentals %s failed symbol=%s err=%s", cache_key_tpl, symbol, err)
-        stale = _rget(cache_key)
-        if stale:
-            stale["_stale"] = True
-            return cached_json(stale, max_age=60)
-        return jsonify(dict(empty_template, symbol=symbol))
-
-
-# ---------------------------------------------------------------------------
-# Warm-up thread
+# Startup warm-up
 # ---------------------------------------------------------------------------
 def _warmup_cache():
-    WARMUP_STATE["started_at"] = int(time.time())
     time.sleep(3)
-    logger.info("Starting warm-up for tickers: %s", DEFAULT_WARMUP_TICKERS)
+    logger.info("Starting word cloud warm-up for tickers: %s", DEFAULT_WARMUP_TICKERS)
     for sym in DEFAULT_WARMUP_TICKERS:
         try:
             payload = get_cached_wordcloud(sym)
             logger.info(
-                "Warm-up complete sym=%s articles=%d words=%d",
-                sym,
-                payload.get("article_count", 0),
-                len(payload.get("words", [])),
+                "Warm-up complete: %s (articles=%d, words=%d)",
+                sym, payload.get("article_count", 0), len(payload.get("words", [])),
             )
         except Exception as e:
-            logger.warning("Warm-up failed sym=%s err=%s", sym, e)
-            WARMUP_STATE["errors"].append(f"{sym}: {e}")
+            logger.warning("Warm-up failed for %s: %s", sym, e)
         time.sleep(1)
-    WARMUP_STATE["complete"] = True
 
 
 threading.Thread(target=_warmup_cache, daemon=True).start()
@@ -1429,27 +1072,22 @@ threading.Thread(target=_warmup_cache, daemon=True).start()
 # Error handlers
 # ---------------------------------------------------------------------------
 @app.errorhandler(404)
-def _not_found(_error):
+def not_found(_error):
     return jsonify({"error": "Not found"}), 404
 
 
 @app.errorhandler(405)
-def _method_not_allowed(_error):
+def method_not_allowed(_error):
     return jsonify({"error": "Method not allowed"}), 405
 
 
-@app.errorhandler(429)
-def _rate_limited(_error):
-    return jsonify({"error": "Rate limit exceeded"}), 429
-
-
 @app.errorhandler(500)
-def _internal_server_error(_error):
+def internal_server_error(_error):
     return jsonify({"error": "Internal server error"}), 500
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Endpoints
 # ---------------------------------------------------------------------------
 @app.get("/")
 def index():
@@ -1462,66 +1100,8 @@ def health_check():
         "status": "up",
         "redis": bool(_redis_client),
         "market_open": is_market_open(),
-        "circuit_open": time.time() < FINNHUB_CIRCUIT["open_until"],
-        "warmup": WARMUP_STATE,
         "warmup_tickers": DEFAULT_WARMUP_TICKERS,
     })
-
-
-@app.get("/api/status")
-def api_status():
-    return jsonify({
-        "cache_sizes": {
-            "quotes": len(QUOTE_CACHE),
-            "profiles": len(PROFILE_CACHE),
-            "candles": len(CANDLE_CACHE),
-            "watchlist": len(WATCHLIST_CACHE),
-            "news": len(NEWS_CACHE),
-            "technicals": len(TECHNICALS_CACHE),
-            "wordcloud": len(WORDCLOUD_CACHE),
-        },
-        "in_flight": len(IN_FLIGHT_EVENTS),
-        "circuit_open": time.time() < FINNHUB_CIRCUIT["open_until"],
-        "redis_connected": bool(_redis_client),
-        "warmup": WARMUP_STATE,
-    })
-
-
-@app.get("/api/dashboard/<symbol>")
-def dashboard(symbol):
-    try:
-        symbol = validate_symbol(symbol)
-    except ValueError as err:
-        return jsonify({"error": str(err)}), 400
-
-    f_quote = _DASHBOARD_POOL.submit(get_cached_quote, symbol)
-    f_profile = _DASHBOARD_POOL.submit(get_cached_profile, symbol)
-    f_news = _DASHBOARD_POOL.submit(get_cached_news, symbol)
-
-    quote_data = f_quote.result() or {}
-    profile_data = f_profile.result() or {}
-    news_data = f_news.result() or []
-
-    return cached_json({
-        "symbol": symbol,
-        "quote": {
-            "current_price": _sf(quote_data.get("c")) or 0.0,
-            "change": _sf(quote_data.get("d")) or 0.0,
-            "percent_change": _sf(quote_data.get("dp")) or 0.0,
-            "high": _sf(quote_data.get("h")) or 0.0,
-            "low": _sf(quote_data.get("l")) or 0.0,
-            "open": _sf(quote_data.get("o")) or 0.0,
-            "previous_close": _sf(quote_data.get("pc")) or 0.0,
-        },
-        "profile": {
-            "name": profile_data.get("name", ""),
-            "logo": profile_data.get("logo", ""),
-            "industry": profile_data.get("finnhubIndustry", ""),
-            "market_cap": _sf(profile_data.get("marketCapitalization")) or 0.0,
-            "country": profile_data.get("country", ""),
-        },
-        "news": news_data[:3],
-    }, max_age=30)
 
 
 @app.get("/api/quote/<symbol>")
@@ -1529,7 +1109,7 @@ def quote(symbol):
     try:
         symbol = validate_symbol(symbol)
         data = get_cached_quote(symbol)
-        return cached_json({
+        return jsonify({
             "symbol": symbol,
             "current_price": _sf(data.get("c")) or 0.0,
             "change": _sf(data.get("d")) or 0.0,
@@ -1541,15 +1121,12 @@ def quote(symbol):
             "volume": data.get("volume"),
             "average_volume": data.get("average_volume"),
             "fifty_two_week": data.get("fifty_two_week"),
-        }, max_age=_quote_ttl_seconds())
+        })
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
     except Exception as error:
-        logger.warning("Quote request degraded symbol=%s err=%s", symbol, error)
-        return jsonify({
-            "symbol": symbol, "current_price": 0.0, "change": 0.0, "percent_change": 0.0,
-            "high": 0.0, "low": 0.0, "open": 0.0, "previous_close": 0.0,
-        })
+        logger.warning("Quote request degraded symbol=%s error=%s", symbol, error)
+        return jsonify({"symbol": symbol, "current_price": 0.0, "change": 0.0, "percent_change": 0.0, "high": 0.0, "low": 0.0, "open": 0.0, "previous_close": 0.0})
 
 
 @app.get("/api/profile/<symbol>")
@@ -1557,17 +1134,17 @@ def profile(symbol):
     try:
         symbol = validate_symbol(symbol)
         data = get_cached_profile(symbol)
-        return cached_json({
+        return jsonify({
             "name": data.get("name", ""),
             "logo": data.get("logo", ""),
             "industry": data.get("finnhubIndustry", ""),
             "market_cap": _sf(data.get("marketCapitalization")) or 0.0,
             "country": data.get("country", ""),
-        }, max_age=3600)
+        })
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
     except Exception as error:
-        logger.warning("Profile request degraded symbol=%s err=%s", symbol, error)
+        logger.warning("Profile request degraded symbol=%s error=%s", symbol, error)
         return jsonify({"name": "", "logo": "", "industry": "", "market_cap": 0.0, "country": ""})
 
 
@@ -1583,8 +1160,12 @@ def candles(symbol):
         if days < 1 or days > 10000:
             raise ValueError("Invalid days parameter (1-10000)")
 
-        force = request.args.get("forceRefresh") == "true"
-        data = get_cached_candles(symbol, resolution, days, force_refresh=force)
+        if request.args.get("forceRefresh") == "true":
+            cache_key = (symbol.upper(), resolution, days)
+            with CACHE_LOCK:
+                CANDLE_CACHE.pop(cache_key, None)
+
+        data = get_cached_candles(symbol, resolution, days)
 
         raw_timestamps = data.get("timestamps", [])
         use_et = resolution in {"1", "5", "15", "30", "60"}
@@ -1594,13 +1175,11 @@ def candles(symbol):
         for ts in raw_timestamps:
             try:
                 dt = datetime.fromtimestamp(int(ts), tz)
-                formatted_date_strings.append(
-                    dt.strftime("%Y-%m-%d %H:%M") if use_et else dt.strftime("%Y-%m-%d")
-                )
+                formatted_date_strings.append(dt.strftime("%Y-%m-%d %H:%M") if use_et else dt.strftime("%Y-%m-%d"))
             except Exception:
                 formatted_date_strings.append("")
 
-        return cached_json({
+        return jsonify({
             "c": data.get("close", []),
             "h": data.get("high", []),
             "l": data.get("low", []),
@@ -1613,15 +1192,12 @@ def candles(symbol):
             "low": data.get("low", []),
             "close": data.get("close", []),
             "volume": data.get("volume", []),
-        }, max_age=_candle_ttl_seconds(days, resolution))
+        })
     except (ValueError, TypeError) as error:
         return jsonify({"error": str(error)}), 400
     except Exception as error:
-        logger.warning("Candle request degraded symbol=%s err=%s", symbol, error)
-        return jsonify({
-            "c": [], "h": [], "l": [], "o": [], "v": [], "t": [],
-            "timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": [],
-        })
+        logger.warning("Candle request degraded symbol=%s error=%s", symbol, error)
+        return jsonify({"c": [], "h": [], "l": [], "o": [], "v": [], "t": [], "timestamps": [], "open": [], "high": [], "low": [], "close": [], "volume": []})
 
 
 @app.get("/api/watchlist")
@@ -1633,11 +1209,11 @@ def watchlist():
         symbols = [s.strip().upper() for s in symbols_param.split(",") if s.strip()]
         if not symbols:
             return jsonify([])
-        return cached_json(get_cached_watchlist(symbols), max_age=WATCHLIST_TTL_SECONDS)
+        return jsonify(get_cached_watchlist(symbols))
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
     except Exception as error:
-        logger.warning("Watchlist request degraded err=%s", error)
+        logger.warning("Watchlist request degraded error=%s", error)
         return jsonify([])
 
 
@@ -1649,47 +1225,14 @@ def price_lookup(symbol):
             formatted_sym = format_forex_symbol(raw_sym)
             data = twelvedata_get("exchange_rate", {"symbol": formatted_sym})
             if data and "rate" in data:
-                return jsonify({
-                    "symbol": raw_sym,
-                    "price": _sf(data["rate"]) or 0.0,
-                    "type": "exchange_rate",
-                })
+                return jsonify({"symbol": raw_sym, "price": _sf(data["rate"]) or 0.0, "type": "exchange_rate"})
         data = twelvedata_get("price", {"symbol": raw_sym})
         if data and "price" in data:
-            return jsonify({
-                "symbol": raw_sym,
-                "price": _sf(data["price"]) or 0.0,
-                "type": "stock_price",
-            })
+            return jsonify({"symbol": raw_sym, "price": _sf(data["price"]) or 0.0, "type": "stock_price"})
         q = get_cached_quote(raw_sym)
-        return jsonify({
-            "symbol": raw_sym,
-            "price": _sf(q.get("c")) or 0.0,
-            "type": "quote",
-        })
+        return jsonify({"symbol": raw_sym, "price": _sf(q.get("c")) or 0.0, "type": "quote"})
     except Exception as err:
         return jsonify({"error": str(err)}), 400
-
-
-@app.get("/api/search")
-@limiter.limit("30 per minute")
-def search_symbols():
-    q = request.args.get("q", "").strip()
-    if len(q) < 1:
-        return jsonify([])
-    try:
-        data = finnhub_get("search", {"q": q})
-        results = data.get("result", [])[:10] if isinstance(data, dict) else []
-        return cached_json([
-            {
-                "symbol": r.get("symbol"),
-                "description": r.get("description"),
-                "type": r.get("type"),
-            }
-            for r in results if r.get("symbol")
-        ], max_age=86400)
-    except FinnhubError:
-        return jsonify([])
 
 
 @app.get("/api/technicals/<symbol>")
@@ -1699,38 +1242,33 @@ def technicals(symbol):
     except ValueError as err:
         return jsonify({"error": str(err)}), 400
 
-    redis_key = f"td:technicals:{symbol}"
-    cached = _rget(redis_key)
+    cache_key = f"td:technicals:{symbol}"
+    cached = _rget(cache_key)
     if cached:
-        return cached_json(cached, max_age=300)
+        return jsonify(cached)
 
     with CACHE_LOCK:
         entry = TECHNICALS_CACHE.get(symbol)
         if entry and time.time() - entry["fetched_at"] < 300:
             _touch_cache(TECHNICALS_CACHE, symbol)
-            return cached_json(entry["data"], max_age=300)
+            return jsonify(entry["data"])
 
-    f_quote = _TECHNICALS_POOL.submit(get_cached_quote, symbol)
-    f_rsi = _TECHNICALS_POOL.submit(
-        twelvedata_get, "rsi",
-        {"symbol": symbol, "interval": "1day", "time_period": 14, "outputsize": 1},
-    )
-    f_macd = _TECHNICALS_POOL.submit(
-        twelvedata_get, "macd",
-        {"symbol": symbol, "interval": "1day", "outputsize": 1},
-    )
-    f_candles = _TECHNICALS_POOL.submit(get_cached_candles, symbol, "D", 260)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        f_quote = pool.submit(get_cached_quote, symbol)
+        f_rsi = pool.submit(twelvedata_get, "rsi", {"symbol": symbol, "interval": "1day", "time_period": 14, "outputsize": 1})
+        f_macd = pool.submit(twelvedata_get, "macd", {"symbol": symbol, "interval": "1day", "outputsize": 1})
+        f_candles = pool.submit(get_cached_candles, symbol, "D", 260)
 
-    quote_data = f_quote.result() or {}
-    rsi_data = f_rsi.result()
-    macd_data = f_macd.result()
-    candles_raw = f_candles.result() or {}
+        quote_data = f_quote.result() or {}
+        rsi_data = f_rsi.result()
+        macd_data = f_macd.result()
+        candles_raw = f_candles.result() or {}
 
     rsi_val = None
     if rsi_data and rsi_data.get("values"):
         rsi_val = _sf(rsi_data["values"][0].get("rsi"))
 
-    macd_val = macd_signal = macd_hist = None
+    macd_val, macd_signal, macd_hist = None, None, None
     if macd_data and macd_data.get("values"):
         v = macd_data["values"][0]
         macd_val = _sf(v.get("macd"))
@@ -1821,12 +1359,7 @@ def technicals(symbol):
             "price_vs_sma200": round(((current_p - sma200) / sma200) * 100, 2) if current_p and sma200 else None,
         },
         "bollinger_bands": {"upper": bb_upper, "middle": bb_mid, "lower": bb_lower},
-        "returns": {
-            "return_1m": ret_1m,
-            "return_3m": ret_3m,
-            "return_6m": ret_6m,
-            "return_1y": ret_1y,
-        },
+        "returns": {"return_1m": ret_1m, "return_3m": ret_3m, "return_6m": ret_6m, "return_1y": ret_1y},
         "signals": {
             "trend": trend_signal,
             "rsi": rsi_status,
@@ -1836,11 +1369,11 @@ def technicals(symbol):
         "timestamp": int(time.time()),
     }
 
-    _rset(redis_key, payload, 300)
+    _rset(cache_key, payload, 300)
     with CACHE_LOCK:
         TECHNICALS_CACHE[symbol] = {"fetched_at": time.time(), "data": payload}
         _prune_cache(TECHNICALS_CACHE)
-    return cached_json(payload, max_age=300)
+    return jsonify(payload)
 
 
 @app.get("/api/news/<symbol>")
@@ -1849,13 +1382,14 @@ def news(symbol):
         symbol = validate_symbol(symbol)
         articles = get_cached_news(symbol)
 
+        # headline required; url normalized upstream
         valid_articles = [
             a for a in (articles if isinstance(articles, list) else [])
             if a.get("headline")
         ]
         valid_articles.sort(key=lambda a: a.get("datetime", 0), reverse=True)
 
-        return cached_json([
+        return jsonify([
             {
                 "headline": a.get("headline", ""),
                 "source": a.get("source", ""),
@@ -1867,16 +1401,15 @@ def news(symbol):
                 ).strftime("%Y-%m-%d %H:%M"),
             }
             for a in valid_articles[:8]
-        ], max_age=300)
+        ])
     except ValueError as error:
         return jsonify({"error": str(error)}), 400
     except Exception as error:
-        logger.warning("News request degraded symbol=%s err=%s", symbol, error)
+        logger.warning("News request degraded symbol=%s error=%s", symbol, error)
         return jsonify([])
 
 
 @app.get("/api/wordcloud/<symbol>")
-@limiter.limit("20 per minute")
 def wordcloud(symbol):
     try:
         symbol = validate_symbol(symbol)
@@ -1896,9 +1429,9 @@ def wordcloud(symbol):
                     pass
 
         payload = get_cached_wordcloud(symbol)
-        return cached_json(payload, max_age=3600)
+        return jsonify(payload)
     except Exception as error:
-        logger.warning("Wordcloud request degraded symbol=%s err=%s", symbol, error)
+        logger.warning("Wordcloud request degraded symbol=%s error=%s", symbol, error)
         return jsonify({
             "symbol": symbol,
             "words": [],
@@ -1908,37 +1441,206 @@ def wordcloud(symbol):
         })
 
 
+# ---------------------------------------------------------------------------
+# Fundamentals & Valuation
+# ---------------------------------------------------------------------------
+_TTL_1DAY = 86400
+_EMPTY_FUNDAMENTALS = {"symbol": "", "name": "", "sector": "", "industry": "", "market_cap": None, "pe_ratio": None, "eps": None, "revenue": None, "profit_margin": None, "shares_outstanding": None, "country": "", "description": ""}
+_EMPTY_INCOME = {"symbol": "", "periods": [], "total_revenue": [], "gross_profit": [], "operating_income": [], "net_income": [], "ebitda": [], "synthetic": False}
+_EMPTY_VALUATION = {"symbol": "", "pe_ratio": None, "pb_ratio": None, "ps_ratio": None, "ev_ebitda": None, "peg_ratio": None, "enterprise_value": None, "market_cap": None}
+
+
+def _get_finnhub_metrics(symbol):
+    try:
+        data = finnhub_get("stock/metric", {"symbol": symbol, "metric": "all"})
+        return data.get("metric", {}) if isinstance(data, dict) else {}
+    except Exception as err:
+        logger.warning("Finnhub metrics fetch failed symbol=%s err=%s", symbol, err)
+        return {}
+
+
+def _fundamentals_payload(symbol):
+    profile = get_cached_profile(symbol)
+    metrics = _get_finnhub_metrics(symbol)
+
+    description = ""
+    try:
+        import yfinance as yf
+        t = yf.Ticker(symbol)
+        info = t.info or {}
+        description = str(info.get("longBusinessSummary") or "")[:600]
+    except Exception:
+        pass
+
+    if not description:
+        description = f"{profile.get('name', symbol)} operates in the {profile.get('finnhubIndustry', 'global market')} sector."
+
+    market_cap_raw = _sf(metrics.get("marketCapitalization")) or _sf(profile.get("marketCapitalization"))
+    market_cap = market_cap_raw * 1e6 if market_cap_raw else None
+
+    rev_per_share = _sf(metrics.get("revenuePerShareTTM"))
+    shares = _sf(metrics.get("sharesOutstanding"))
+    total_rev = None
+    if rev_per_share and shares:
+        total_rev = rev_per_share * shares * 1e6
+    elif market_cap and _sf(metrics.get("psTTM")):
+        total_rev = market_cap / _sf(metrics.get("psTTM"))
+
+    margin = _sf(metrics.get("netMarginTTM")) or _sf(metrics.get("netMarginAnnual"))
+    if margin:
+        margin = margin / 100.0
+
+    return {
+        "symbol": symbol,
+        "name": profile.get("name") or symbol,
+        "sector": profile.get("finnhubIndustry") or "",
+        "industry": profile.get("finnhubIndustry") or "",
+        "market_cap": market_cap,
+        "pe_ratio": _sf(metrics.get("peTTM")) or _sf(metrics.get("peNormalizedAnnual")) or _sf(metrics.get("peAnnual")),
+        "eps": _sf(metrics.get("epsTTM")) or _sf(metrics.get("epsAnnual")),
+        "revenue": total_rev,
+        "profit_margin": margin,
+        "shares_outstanding": shares,
+        "country": profile.get("country") or "",
+        "description": description,
+    }
+
+
+def _income_payload(symbol):
+    try:
+        import pandas as pd
+        import yfinance as yf
+        t = yf.Ticker(symbol)
+        df = t.financials
+        if df is not None and not df.empty:
+            df = df.T.sort_index()
+
+            def col(df, *names):
+                for n in names:
+                    if n in df.columns:
+                        return [None if pd.isna(v) else round(float(v), 2) for v in df[n]]
+                return []
+
+            periods = [str(idx)[:10] for idx in df.index]
+            return {
+                "symbol": symbol,
+                "periods": periods,
+                "total_revenue": col(df, "Total Revenue"),
+                "gross_profit": col(df, "Gross Profit"),
+                "operating_income": col(df, "Operating Income", "EBIT"),
+                "net_income": col(df, "Net Income"),
+                "ebitda": col(df, "EBITDA", "Normalized EBITDA"),
+                "synthetic": False,
+            }
+    except Exception as err:
+        logger.warning("yfinance income failed symbol=%s err=%s", symbol, err)
+
+    profile = get_cached_profile(symbol)
+    metrics = _get_finnhub_metrics(symbol)
+    market_cap_raw = _sf(metrics.get("marketCapitalization")) or _sf(profile.get("marketCapitalization")) or 1e5
+    market_cap = market_cap_raw * 1e6
+    ps = _sf(metrics.get("psTTM")) or 5.0
+    base_rev = market_cap / ps if ps > 0 else 1e10
+    growth = (_sf(metrics.get("revenueGrowthTTMYoy")) or 10.0) / 100.0
+    margin = (_sf(metrics.get("netMarginTTM")) or 15.0) / 100.0
+
+    revs = [round(base_rev / ((1 + growth) ** (3 - i)), 2) for i in range(4)]
+    nets = [round(r * margin, 2) for r in revs]
+    gross = [round(r * 0.45, 2) for r in revs]
+    op = [round(r * 0.25, 2) for r in revs]
+    ebitda = [round(r * 0.30, 2) for r in revs]
+
+    return {
+        "symbol": symbol,
+        "periods": ["2021", "2022", "2023", "2024"],
+        "total_revenue": revs,
+        "gross_profit": gross,
+        "operating_income": op,
+        "net_income": nets,
+        "ebitda": ebitda,
+        "synthetic": True,
+        "_note": "Synthetic estimate — real financials unavailable",
+    }
+
+
+def _valuation_payload(symbol):
+    profile = get_cached_profile(symbol)
+    metrics = _get_finnhub_metrics(symbol)
+
+    market_cap_raw = _sf(metrics.get("marketCapitalization")) or _sf(profile.get("marketCapitalization"))
+    market_cap = market_cap_raw * 1e6 if market_cap_raw else None
+
+    pe = _sf(metrics.get("peTTM")) or _sf(metrics.get("peNormalizedAnnual")) or _sf(metrics.get("peAnnual"))
+    pb = _sf(metrics.get("pbQuarterly")) or _sf(metrics.get("pbAnnual"))
+    ps = _sf(metrics.get("psTTM")) or _sf(metrics.get("psAnnual"))
+    peg = _sf(metrics.get("pegAnnual")) or _sf(metrics.get("pegTTM"))
+    ev_ebitda = _sf(metrics.get("evToEbitdaAnnual")) or _sf(metrics.get("evToEbitdaTTM"))
+
+    ev_raw = _sf(metrics.get("enterpriseValue"))
+    ev = ev_raw * 1e6 if ev_raw else None
+
+    if not ev_ebitda or not ev:
+        try:
+            import yfinance as yf
+            t = yf.Ticker(symbol)
+            info = t.info or {}
+            if not ev_ebitda:
+                ev_ebitda = _sf(info.get("enterpriseToEbitda"))
+            if not ev:
+                ev = _sf(info.get("enterpriseValue"))
+        except Exception:
+            pass
+
+    return {
+        "symbol": symbol,
+        "pe_ratio": pe,
+        "pb_ratio": pb,
+        "ps_ratio": ps,
+        "ev_ebitda": ev_ebitda,
+        "peg_ratio": peg,
+        "enterprise_value": ev or market_cap,
+        "market_cap": market_cap,
+    }
+
+
+def _fundamentals_endpoint(symbol, cache_key_tpl, builder_fn, empty_template, ttl):
+    try:
+        symbol = validate_symbol(symbol)
+    except ValueError as err:
+        return jsonify({"error": str(err)}), 400
+
+    cache_key = cache_key_tpl.format(symbol=symbol)
+    cached = _rget(cache_key)
+    if cached:
+        return jsonify(cached)
+
+    try:
+        payload = builder_fn(symbol)
+        _rset(cache_key, payload, ttl)
+        return jsonify(payload)
+    except Exception as err:
+        logger.warning("Fundamentals %s failed symbol=%s err=%s", cache_key_tpl, symbol, err)
+        stale = _rget(cache_key)
+        if stale:
+            return jsonify(stale)
+        return jsonify(dict(empty_template, symbol=symbol))
+
+
 @app.get("/api/fundamentals/<symbol>")
 def fundamentals(symbol):
-    return _fundamentals_endpoint(
-        symbol, "fin:fundamentals:{symbol}", _fundamentals_payload,
-        _EMPTY_FUNDAMENTALS, _TTL_1DAY,
-    )
+    return _fundamentals_endpoint(symbol, "fin:fundamentals:{symbol}", _fundamentals_payload, _EMPTY_FUNDAMENTALS, _TTL_1DAY)
 
 
 @app.get("/api/income/<symbol>")
 def income(symbol):
-    return _fundamentals_endpoint(
-        symbol, "fin:income:{symbol}", _income_payload,
-        _EMPTY_INCOME, _TTL_1DAY,
-    )
+    return _fundamentals_endpoint(symbol, "fin:income:{symbol}", _income_payload, _EMPTY_INCOME, _TTL_1DAY)
 
 
 @app.get("/api/valuation/<symbol>")
 def valuation(symbol):
-    return _fundamentals_endpoint(
-        symbol, "fin:valuation:{symbol}", _valuation_payload,
-        _EMPTY_VALUATION, _TTL_1DAY,
-    )
+    return _fundamentals_endpoint(symbol, "fin:valuation:{symbol}", _valuation_payload, _EMPTY_VALUATION, _TTL_1DAY)
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
-    app.run(
-        host="0.0.0.0",
-        port=port,
-        debug=os.getenv("FLASK_DEBUG", "False") == "True",
-    )
+    app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG", "False") == "True") 
