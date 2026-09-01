@@ -85,13 +85,16 @@ WATCHLIST_TTL_SECONDS = 300
 FOREX_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD", "CNY", "HKD", "SGD"}
 
 # ---------------------------------------------------------------------------
-# Word cloud configuration
+# ADVANCED WORD CLOUD CONFIGURATION
 # ---------------------------------------------------------------------------
 WORDCLOUD_REFRESH_HOUR_ET = 6
-WORDCLOUD_MAX_WORDS = 50
-WORDCLOUD_MIN_WORD_LENGTH = 2
+WORDCLOUD_MAX_WORDS = 40
+WORDCLOUD_MIN_WORD_LENGTH = 3      # Kills 'is', 'as', 'i', 'to', 'do', 'be'
+WORDCLOUD_MIN_ARTICLE_HITS = 2     # Must appear in >1 article to matter
+WORDCLOUD_MAX_ARTICLE_FRAC = 0.80  # Drop words that appear in >80% of articles (too generic)
 DEFAULT_WARMUP_TICKERS = ["GOOGL", "GOOG", "AAPL", "MSFT"]
 
+# Massive blocklist of grammar + generic news filler
 STOPWORDS = frozenset({
     "the", "and", "for", "are", "but", "not", "you", "all", "can", "had", "her",
     "was", "one", "our", "out", "day", "get", "has", "him", "his", "how", "man",
@@ -117,7 +120,49 @@ STOPWORDS = frozenset({
     "read", "click", "photo", "image", "video", "watch", "listen",
     "amid", "amidst", "however", "although", "though", "thus", "hence",
     "therefore", "moreover", "furthermore", "meanwhile", "including",
+    "announces", "announced", "announce", "expects", "expected", "expect",
+    "sees", "seen", "seeing", "raises", "raised", "raise", "cuts", "cut", "cutting",
+    "hits", "hit", "misses", "missed", "miss", "rises", "rose", "rise", "falling",
+    "gains", "gained", "gain", "drops", "dropped", "drop", "jumps", "jumped", "jump",
+    "slides", "slid", "slide", "surges", "surged", "surge", "plunges", "plunged",
+    "beats", "beat", "beating", "warns", "warned", "warning", "plans", "planned",
+    "reveals", "revealed", "reveal", "confirms", "confirmed", "confirm", "denies",
+    "holds", "held", "hold", "keeps", "kept", "keep", "makes", "made", "takes",
+    "gives", "gave", "give", "shows", "showed", "show", "comes", "came", "goes",
+    "gets", "got", "sets", "set", "setting", "looks", "looked", "look", "seems",
+    "remains", "remained", "remain", "continues", "continued", "continue",
+    "includes", "included", "include", "follows", "followed", "follow",
+    "based", "related", "regarding", "towards", "toward", "across", "among",
+    "already", "even", "back", "down", "those", "since", "above", "below",
+    "further", "once", "both", "most", "same", "very", "don", "thing", "things",
+    "stuff", "lot", "lots", "kind", "type", "ways", "part", "parts", "percentage",
+    "number", "numbers", "people", "person", "anyone", "someone", "everyone"
 })
+
+# Boost high-signal finance keywords
+WORDCLOUD_BOOST = {
+    "earnings": 2.4, "revenue": 2.2, "profit": 2.0, "loss": 1.8,
+    "guidance": 2.5, "outlook": 2.2, "forecast": 2.0, "estimate": 1.8,
+    "eps": 2.3, "ebitda": 2.2, "margin": 1.9, "cash": 1.6,
+    "dividend": 2.0, "buyback": 2.1, "repurchase": 2.0,
+    "ipo": 2.2, "spac": 1.8, "merger": 2.3, "acquisition": 2.3,
+    "deal": 1.7, "takeover": 2.2, "spinoff": 2.0,
+    "inflation": 2.3, "interest": 1.7, "rates": 1.9, "rate": 1.6,
+    "fed": 2.4, "fomc": 2.4, "treasury": 2.0, "yield": 2.0, "yields": 2.0,
+    "recession": 2.3, "gdp": 2.1, "cpi": 2.2, "ppi": 2.0, "jobs": 1.8,
+    "unemployment": 2.1, "tariff": 2.4, "tariffs": 2.4, "sanction": 2.0,
+    "sanctions": 2.0, "regulation": 1.9, "antitrust": 2.2,
+    "upgrade": 2.0, "downgrade": 2.0, "overweight": 1.9, "underweight": 1.9,
+    "bullish": 1.8, "bearish": 1.8, "rally": 1.8, "selloff": 2.0,
+    "volatility": 2.0, "short": 1.5, "squeeze": 2.0,
+    "ai": 2.0, "chip": 1.9, "chips": 1.9, "semiconductor": 2.2,
+    "cloud": 1.7, "cybersecurity": 2.0, "ev": 1.8, "battery": 1.8,
+    "oil": 1.8, "crude": 1.9, "gas": 1.5, "opec": 2.2,
+    "bank": 1.6, "banks": 1.6, "credit": 1.7, "debt": 1.8, "default": 2.1,
+    "bankruptcy": 2.3, "lawsuit": 2.0, "settlement": 1.9, "probe": 1.9,
+    "layoff": 2.1, "layoffs": 2.1, "hiring": 1.7,
+    "sec": 2.0, "doj": 2.0, "ftc": 2.0, "fda": 2.0,
+}
 
 # ---------------------------------------------------------------------------
 # Redis
@@ -1092,7 +1137,7 @@ def get_cached_news(symbol):
 
 
 # ---------------------------------------------------------------------------
-# Word cloud
+# Advanced Word cloud (Importance based TF-IDF)
 # ---------------------------------------------------------------------------
 def _next_wordcloud_refresh_epoch():
     now_et = datetime.now(ZoneInfo("America/New_York"))
@@ -1102,10 +1147,8 @@ def _next_wordcloud_refresh_epoch():
     next_refresh = refresh_today if now_et < refresh_today else refresh_today + timedelta(days=1)
     return next_refresh.timestamp()
 
-
 def _wordcloud_ttl_seconds():
     return max(int(_next_wordcloud_refresh_epoch() - time.time()), 60)
-
 
 def _tokenize_text(text):
     if not text:
@@ -1113,37 +1156,89 @@ def _tokenize_text(text):
     cleaned = re.sub(r"http\S+|www\.\S+", " ", text)
     cleaned = re.sub(r"&[a-z]+;", " ", cleaned)
     cleaned = re.sub(r"[^a-zA-Z\s'-]", " ", cleaned)
-    return [w.lower().strip("'-") for w in cleaned.split() if w.strip("'-")]
+    tokens = []
+    for w in cleaned.split():
+        tok = w.strip("'-").lower()
+        if not tok: continue
+        tokens.append(tok)
+    return tokens
 
+def _is_noise_token(token, ticker_lower):
+    if len(token) < WORDCLOUD_MIN_WORD_LENGTH: return True
+    if token in STOPWORDS: return True
+    if token == ticker_lower: return True
+    if token.isdigit(): return True
+    if token.endswith("'s") and len(token) <= 4: return True
+    if len(set(token)) == 1: return True
+    return False
+
+def _token_boost(token):
+    if token in WORDCLOUD_BOOST: return WORDCLOUD_BOOST[token]
+    if len(token) >= 8: return 1.25
+    if len(token) >= 6: return 1.1
+    return 1.0
 
 def _build_wordcloud_from_articles(articles, ticker):
-    ticker_lower = ticker.lower()
-    counter = Counter()
+    ticker_lower = (ticker or "").lower()
+    articles = [a for a in (articles or []) if isinstance(a, dict)]
+    n_articles = max(len(articles), 1)
 
-    for article in articles or []:
+    tf = Counter()
+    df = Counter()
+    headline_hits = Counter()
+
+    for article in articles:
         headline = article.get("headline", "") or ""
         summary = article.get("summary", "") or ""
-        combined = f"{headline} {summary}"
 
-        for token in _tokenize_text(combined):
-            if len(token) < WORDCLOUD_MIN_WORD_LENGTH:
-                continue
-            if token in STOPWORDS:
-                continue
-            if token == ticker_lower:
-                continue
-            if token.isdigit():
-                continue
-            counter[token] += 1
+        h_tokens = [t for t in _tokenize_text(headline) if not _is_noise_token(t, ticker_lower)]
+        s_tokens = [t for t in _tokenize_text(summary) if not _is_noise_token(t, ticker_lower)]
 
-    top = counter.most_common(WORDCLOUD_MAX_WORDS)
-    max_count = top[0][1] if top else 1
+        in_this_article = set()
+        for t in h_tokens:
+            tf[t] += 2
+            headline_hits[t] += 1
+            in_this_article.add(t)
+        for t in s_tokens:
+            tf[t] += 1
+            in_this_article.add(t)
+
+        for t in in_this_article:
+            df[t] += 1
+
+    scored = []
+    for token, freq in tf.items():
+        article_hits = df[token]
+        article_frac = article_hits / n_articles
+
+        if article_hits < WORDCLOUD_MIN_ARTICLE_HITS and n_articles >= 3:
+            if token not in WORDCLOUD_BOOST and len(token) < 7: continue
+
+        if article_frac > WORDCLOUD_MAX_ARTICLE_FRAC and token not in WORDCLOUD_BOOST:
+            continue
+
+        rarity = (1.0 - article_frac) ** 2
+        diversity = math.log1p(article_hits)
+        boost = _token_boost(token)
+        headline_bonus = 1.0 + min(headline_hits[token], 5) * 0.08
+
+        score = freq * diversity * max(rarity, 0.05) * boost * headline_bonus
+        scored.append((token, freq, article_hits, score))
+
+    scored.sort(key=lambda x: x[3], reverse=True)
+    top = scored[:WORDCLOUD_MAX_WORDS]
+    max_score = top[0][3] if top else 1.0
 
     return [
-        {"text": word, "value": count, "weight": round(count / max_count, 3)}
-        for word, count in top
+        {
+            "text": word,
+            "value": round(score, 3),          
+            "count": count,                   
+            "articles": hits,                 
+            "weight": round(score / max_score, 3),
+        }
+        for word, count, hits, score in top
     ]
-
 
 def get_cached_wordcloud(symbol):
     key = symbol.upper()
@@ -1172,8 +1267,8 @@ def get_cached_wordcloud(symbol):
         event.wait(timeout=REQUEST_TIMEOUT_SECONDS + 2)
         with CACHE_LOCK:
             entry = WORDCLOUD_CACHE.get(key)
-            if entry:
-                return entry["data"]
+            if entry: return entry["data"]
+            return {"words": []}
 
     try:
         articles = get_cached_news(symbol)
@@ -1432,16 +1527,13 @@ threading.Thread(target=_warmup_cache, daemon=True).start()
 def _not_found(_error):
     return jsonify({"error": "Not found"}), 404
 
-
 @app.errorhandler(405)
 def _method_not_allowed(_error):
     return jsonify({"error": "Method not allowed"}), 405
 
-
 @app.errorhandler(429)
 def _rate_limited(_error):
     return jsonify({"error": "Rate limit exceeded"}), 429
-
 
 @app.errorhandler(500)
 def _internal_server_error(_error):
